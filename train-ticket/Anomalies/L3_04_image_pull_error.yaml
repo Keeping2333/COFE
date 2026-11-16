@@ -1,0 +1,137 @@
+# ==============================================================================
+# L3-04: Image Pull Error (Platform Layer)  [OOD — new fault type]
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: Kubernetes image pull subsystem
+#   Target Component: ts-basic-service deployment image tag
+#   Description: Patches the target deployment's image to a non-existent tag,
+#                forcing the new ReplicaSet's pods to stay in ImagePullBackOff /
+#                ErrImagePull. The old ReplicaSet's pods continue serving
+#                traffic, so app-level signal may be minimal — the fault is
+#                visible ONLY in the K8s platform layer. Distinct from:
+#                - L3_01 (pod kill → restarts_total ++)
+#                - L3_02 (liveness fails → CrashLoopBackOff)
+#                - L3_03 (resourcequota_used at hard limit)
+#   Realism Score: HIGH — image pull errors happen with registry outages,
+#                typo'd tags during deploys, network issues to image registry,
+#                or revoked credentials.
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: K8s State + Events
+#     Expected Indicator:
+#       - kube_pod_waiting_reason="ImagePullBackOff" (NEW reason value)
+#       - kube_deployment_status_replicas_unavailable increases
+#       - kube_deployment_status_replicas_available stays at old steady value
+#   Secondary Evidence:
+#     - K8s Events: "Failed to pull image", "ErrImagePull", "ImagePullBackOff"
+#     - kube_pod_phase: new pods stuck in "Pending"
+#     - App-level traces/logs: NO degradation if old pods still serve traffic
+#       (this is the diagnostic challenge — model must use platform signal)
+#
+# Duration: 90 seconds (image stays broken; revert at end)
+# Injection Method: kubectl patch deployment with non-existent tag
+# Target: Deployment image tag for TARGET_APP
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l3-image-pull-error-injector
+  namespace: tt
+  labels:
+    chaos-layer: L3
+    chaos-type: image-pull-error
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L3
+        chaos-type: image-pull-error
+    spec:
+      serviceAccountName: chaos-runner
+      containers:
+        - name: image-pull-error-injector
+          image: bitnami/kubectl:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              TARGET_APP=${TARGET_APP:-ts-basic-service}
+              NAMESPACE=tt
+              DURATION=${DURATION:-90}
+              BROKEN_TAG=${BROKEN_TAG:-"chaos-nonexistent-tag-$(date +%s)"}
+
+              echo "=============================================="
+              echo "L3 ANOMALY: Image Pull Error Injection"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "Target Deployment: ${TARGET_APP}"
+              echo "Duration: ${DURATION}s"
+              echo "=============================================="
+
+              # Find container name and current image (assume single container)
+              ORIGINAL_IMAGE=$(kubectl get deployment -n ${NAMESPACE} ${TARGET_APP} \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}')
+              CONTAINER_NAME=$(kubectl get deployment -n ${NAMESPACE} ${TARGET_APP} \
+                  -o jsonpath='{.spec.template.spec.containers[0].name}')
+
+              if [ -z "$ORIGINAL_IMAGE" ] || [ -z "$CONTAINER_NAME" ]; then
+                  echo "[ERROR] Could not read original image/container for ${TARGET_APP}"
+                  exit 1
+              fi
+
+              # Strip tag from image, append broken tag.
+              IMAGE_BASE="${ORIGINAL_IMAGE%:*}"
+              BROKEN_IMAGE="${IMAGE_BASE}:${BROKEN_TAG}"
+
+              echo "[INFO] Container:        ${CONTAINER_NAME}"
+              echo "[INFO] Original image:   ${ORIGINAL_IMAGE}"
+              echo "[INFO] Broken image:     ${BROKEN_IMAGE}"
+
+              # Trap to ensure revert happens on signal/error
+              cleanup() {
+                  echo "[CLEANUP] Reverting image to ${ORIGINAL_IMAGE}..."
+                  kubectl set image deployment -n ${NAMESPACE} ${TARGET_APP} \
+                      ${CONTAINER_NAME}=${ORIGINAL_IMAGE} 2>/dev/null || true
+                  echo "[CLEANUP] Image reverted."
+              }
+              trap cleanup EXIT INT TERM
+
+              # Patch the deployment with the broken tag — triggers a rollout
+              # whose new ReplicaSet pods will fail to pull. Old pods stay up.
+              echo "[INJECT] Patching deployment to broken image..."
+              kubectl set image deployment -n ${NAMESPACE} ${TARGET_APP} \
+                  ${CONTAINER_NAME}=${BROKEN_IMAGE}
+
+              # Brief wait, then show what's happening.
+              sleep 10
+              echo "[INFO] Pod status after patch:"
+              kubectl get pods -n ${NAMESPACE} -l app=${TARGET_APP} \
+                  -o wide --no-headers | head -10
+
+              echo "[INFO] Recent events (last 5):"
+              kubectl get events -n ${NAMESPACE} \
+                  --field-selector=reason=Failed \
+                  --sort-by='.lastTimestamp' 2>/dev/null | tail -5 || true
+
+              echo "[INJECT] Image pull error active; sleeping for remaining $((DURATION - 10))s..."
+              sleep $((DURATION - 10))
+
+              echo "[INFO] Final pod status before revert:"
+              kubectl get pods -n ${NAMESPACE} -l app=${TARGET_APP} \
+                  -o wide --no-headers | head -10
+
+              # cleanup() runs via trap
+
+              echo "[COMPLETE] Image pull error injection finished at $(date -Iseconds)"
+          env:
+            - name: TARGET_APP
+              value: "ts-basic-service"
+            - name: DURATION
+              value: "90"
+      restartPolicy: Never

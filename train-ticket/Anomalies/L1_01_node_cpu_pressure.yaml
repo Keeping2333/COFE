@@ -1,0 +1,132 @@
+# ==============================================================================
+# L1-01: Node CPU Pressure (Infrastructure Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: Node-level CPU resource exhaustion
+#   Target Component: Kubernetes worker node (train-ticket-worker)
+#   Description: Simulates CPU contention at the host level, affecting ALL pods
+#                on the node. This mimics scenarios like noisy neighbors, runaway
+#                processes, or insufficient node capacity.
+#   Realism Score: HIGH - CPU throttling is extremely common in multi-tenant K8s
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: Metrics
+#     Expected Indicator: 
+#       - node_cpu_seconds_total (user+system) approaches 100%
+#       - container_cpu_throttled_seconds_total increases across ALL pods
+#       - container_cpu_cfs_throttled_periods_total spikes
+#   Secondary Evidence:
+#     - Application logs show increased response times
+#     - Traces show elevated span durations uniformly across services
+#     - K8s events: "FailedScheduling" if new pods attempt to schedule
+#
+# Duration: 120 seconds (adjustable via DURATION env var)
+# Injection Tool: stress-ng (installed on node via DaemonSet)
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l1-cpu-pressure-script
+  namespace: tt
+  labels:
+    chaos-layer: L1
+    chaos-type: cpu-pressure
+data:
+  inject.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Configuration
+    DURATION=${DURATION:-120}
+    CPU_WORKERS=${CPU_WORKERS:-0}  # 0 = auto-detect all CPUs
+    CPU_LOAD=${CPU_LOAD:-95}       # Target CPU load percentage
+    
+    echo "=============================================="
+    echo "L1 ANOMALY: Node CPU Pressure Injection"
+    echo "=============================================="
+    echo "Start Time: $(date -Iseconds)"
+    echo "Duration: ${DURATION}s"
+    echo "CPU Workers: ${CPU_WORKERS} (0=all cores)"
+    echo "Target Load: ${CPU_LOAD}%"
+    echo "=============================================="
+    
+    # Install stress-ng if not present
+    if ! command -v stress-ng &> /dev/null; then
+        echo "[INFO] Installing stress-ng..."
+        apt-get update -qq && apt-get install -y -qq stress-ng
+    fi
+    
+    echo "[INJECT] Starting CPU stress at $(date -Iseconds)"
+    
+    # Run stress-ng with CPU load
+    # --cpu 0: use all available CPUs
+    # --cpu-load: target percentage
+    # --timeout: duration
+    stress-ng --cpu ${CPU_WORKERS} \
+              --cpu-load ${CPU_LOAD} \
+              --timeout ${DURATION}s \
+              --metrics-brief \
+              --log-brief
+    
+    echo "[COMPLETE] CPU stress finished at $(date -Iseconds)"
+    
+  cleanup.sh: |
+    #!/bin/bash
+    echo "[CLEANUP] Killing any remaining stress-ng processes..."
+    pkill -9 stress-ng || true
+    echo "[CLEANUP] Done"
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: l1-cpu-pressure-injector
+  namespace: tt
+  labels:
+    chaos-layer: L1
+    chaos-type: cpu-pressure
+    chaos-experiment: active
+spec:
+  hostPID: true
+  hostNetwork: true
+  nodeSelector:
+    kubernetes.io/hostname: train-ticket-worker
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: stress-injector
+      image: ubuntu:22.04
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          cp /scripts/inject.sh /tmp/inject.sh
+          chmod +x /tmp/inject.sh
+          /tmp/inject.sh
+      env:
+        - name: DURATION
+          value: "120"
+        - name: CPU_WORKERS
+          value: "0"
+        - name: CPU_LOAD
+          value: "95"
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "64Mi"
+        limits:
+          cpu: "8000m"  # Allow it to consume node CPU
+          memory: "256Mi"
+  volumes:
+    - name: scripts
+      configMap:
+        name: l1-cpu-pressure-script
+        defaultMode: 0755
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5

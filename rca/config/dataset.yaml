@@ -1,0 +1,69 @@
+# ============================================================
+# Dataset configuration for Full-stack RCA
+# Switch datasets by changing this file — no script edits needed.
+# ============================================================
+
+dataset:
+  # Dataset type: "anomod" | "locust" | "sn"
+  type: locust
+
+  # Root directory containing the experiment data.
+  # Round3 (356 experiments, 12 fault types, OTel jsonl logs, 61 metric files
+  # per experiment). Differs from round2 in two ways: (1) +1 metric channel
+  # system_disk_pending_operations (60→61), (2) L2_01 fault is now
+  # connection_reset (was dns_failure). Round1/round2 no longer active.
+  path: train-ticket/exp_runs/batch/round3
+
+  # Dataset-specific parameters
+  params:
+    max_traces_per_experiment: 200   # locust: per-experiment; anomod/sn: max_traces_per_scenario
+    max_spans_per_trace: 30
+    min_spans_per_trace: 2           # filter out trivial traces (0-1 spans = no call chain)
+    metric_window_seconds: 60.0
+    num_metrics: 61                  # round3: full 61-channel metric tensor
+    max_metric_points: 60
+    # T1+T2+T3: rich span features (operation_name, service_name, status_code,
+    # is_root/leaf, is_on_critical_path).
+    # Off by default — when False, the dataset and trace encoder produce
+    # byte-identical output to pre-modification. Flip this to true together
+    # with model.trace.enable_rich_features below.
+    enable_rich_span_features: false
+    num_service_buckets: 64
+    num_operation_buckets: 1024
+    num_error_type_buckets: 32   # OTel error.type hash buckets
+
+    # Channels listed here are zeroed in the metric tensor (both the encoder
+    # input and the LLM summary). Empty list = no masking.
+    mask_metric_channels:
+      - system_cpu_by_mode
+      - system_disk_io_bytes
+      - system_disk_operations
+      - system_disk_io_time
+      - system_disk_weighted_io_time
+      - network_io_bytes
+      - network_packets
+
+# Model overrides — currently only for the rich-feature flag on the trace encoder.
+# Hyperparameters not listed here continue to use the train.py defaults.
+model:
+  trace:
+    enable_rich_features: false   # must mirror dataset.params.enable_rich_span_features
+    service_embed_dim: 16
+    operation_embed_dim: 32
+    status_embed_dim: 4
+    num_status_classes: 4
+    # OTel error tags (error / error.type / otel.status_code).
+    error_type_embed_dim: 8
+    num_otel_status_classes: 3
+    otel_status_embed_dim: 4
+
+# Model checkpoint directory.
+# round3 retrain (DistilBERT unfrozen, rich features OFF) — the current anchor.
+
+# lived here; round2's checkpoints_6span/ is kept as a frozen archive.
+checkpoint_dir: checkpoints
+
+# Knowledge base directory.
+# round3 experiment-level KB (anomaly-weighted pooling), built with build_kb.py
+# default (--aggregate ON). round2's knowledge_base_6span_agg/ kept as archive.
+kb_dir: knowledge_base

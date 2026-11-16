@@ -1,0 +1,148 @@
+# ==============================================================================
+# L1-02: Disk I/O Saturation (Infrastructure Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: Node storage subsystem saturation
+#   Target Component: Node disk (/var/lib/containerd, /var/log)
+#   Description: Simulates disk I/O bottleneck at the host level. This affects
+#                container logging, image pulls, and any pod using local storage.
+#                Common in environments with slow disks or heavy log volume.
+#   Realism Score: HIGH - Disk I/O contention is a top-3 infra issue in K8s
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: Metrics
+#     Expected Indicator:
+#       - node_disk_io_time_weighted_seconds_total > 1 (100% utilization)
+#       - node_disk_read_time_seconds_total / node_disk_writes_completed_total
+#       - container_fs_io_time_weighted_seconds_total increases
+#   Secondary Evidence:
+#     - Application logs show: "Slow disk I/O detected" or write timeouts
+#     - MySQL pods may log: "InnoDB: page_cleaner: 1000ms intended loop"
+#     - K8s events: "VolumeAttachmentStuck" or "FailedMount"
+#     - Traces show database operations with elevated latency
+#
+# Duration: 90 seconds
+# Injection Tool: stress-ng (iomix stressor)
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l1-disk-io-script
+  namespace: tt
+  labels:
+    chaos-layer: L1
+    chaos-type: disk-io
+data:
+  inject.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Configuration
+    DURATION=${DURATION:-90}
+    IO_WORKERS=${IO_WORKERS:-4}
+    IO_BYTES=${IO_BYTES:-256M}
+    
+    echo "=============================================="
+    echo "L1 ANOMALY: Disk I/O Saturation Injection"
+    echo "=============================================="
+    echo "Start Time: $(date -Iseconds)"
+    echo "Duration: ${DURATION}s"
+    echo "I/O Workers: ${IO_WORKERS}"
+    echo "I/O Bytes per worker: ${IO_BYTES}"
+    echo "=============================================="
+    
+    # Install stress-ng if not present
+    if ! command -v stress-ng &> /dev/null; then
+        echo "[INFO] Installing stress-ng..."
+        apt-get update -qq && apt-get install -y -qq stress-ng
+    fi
+    
+    echo "[INJECT] Starting disk I/O stress at $(date -Iseconds)"
+    
+    # Create temp directory for I/O operations
+    mkdir -p /tmp/chaos-io
+    
+    # Run stress-ng with multiple I/O stressors
+    # --iomix: mixed read/write workload
+    # --hdd: hard disk stress
+    stress-ng --iomix ${IO_WORKERS} \
+              --iomix-bytes ${IO_BYTES} \
+              --hdd ${IO_WORKERS} \
+              --hdd-bytes ${IO_BYTES} \
+              --timeout ${DURATION}s \
+              --temp-path /tmp/chaos-io \
+              --metrics-brief \
+              --log-brief
+    
+    echo "[COMPLETE] Disk I/O stress finished at $(date -Iseconds)"
+    
+    # Cleanup temp files
+    rm -rf /tmp/chaos-io
+    
+  cleanup.sh: |
+    #!/bin/bash
+    echo "[CLEANUP] Killing stress-ng and cleaning temp files..."
+    pkill -9 stress-ng || true
+    rm -rf /tmp/chaos-io
+    echo "[CLEANUP] Done"
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: l1-disk-io-injector
+  namespace: tt
+  labels:
+    chaos-layer: L1
+    chaos-type: disk-io
+    chaos-experiment: active
+spec:
+  hostPID: true
+  hostNetwork: true
+  nodeSelector:
+    kubernetes.io/hostname: train-ticket-worker
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: io-stress-injector
+      image: ubuntu:22.04
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          cp /scripts/inject.sh /tmp/inject.sh
+          chmod +x /tmp/inject.sh
+          /tmp/inject.sh
+      env:
+        - name: DURATION
+          value: "90"
+        - name: IO_WORKERS
+          value: "4"
+        - name: IO_BYTES
+          value: "256M"
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: host-var
+          mountPath: /host-var
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "2000m"
+          memory: "1Gi"
+  volumes:
+    - name: scripts
+      configMap:
+        name: l1-disk-io-script
+        defaultMode: 0755
+    - name: host-var
+      hostPath:
+        path: /var
+        type: Directory
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5

@@ -1,0 +1,142 @@
+# ==============================================================================
+# L4-04: Slow SQL / Table Lock Contention (Application Layer)  [OOD — new fault type]
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: Application data-access latency due to DB lock contention
+#   Target Component: ts-order-service / ts-travel-service / ts-seat-service —
+#                     blocked on JDBC calls to MySQL while a foreign session
+#                     holds a write lock on the relevant table.
+#   Description: External mysql client takes `LOCK TABLES <table> WRITE` on a
+#                table the target service queries during locust traffic. Any
+#                concurrent query against that table waits until UNLOCK. The
+#                target service does NOT exhaust its HikariCP pool (vs L4_02);
+#                it just sees every SQL call take seconds → http_p99 climbs.
+#   Realism Score: HIGH — Real production incidents include long ETL jobs
+#                blocking online queries, runaway report queries holding locks,
+#                or schema migrations forgetting to release.
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: Metrics
+#     Expected Indicator:
+#       - db_connections_use_time[target] step-jump (queries take much longer)
+#       - http_request_latency_p99[target] climbs sharply
+#       - db_connections_pending[target] DOES NOT saturate (vs L4_02)
+#       - jvm_memory_used[target] flat (vs L4_01)
+#       - http error_rate stays low (vs L4_03)
+#   Secondary Evidence:
+#     - target app trace spans on SQL operations show long duration
+#     - jvm_thread_count may rise (threads blocked on JDBC waitForConnection)
+#     - mysql Threads_running rises (sessions waiting for lock)
+#
+# Duration: 90s lock hold (inside the 120s injection window)
+# Injection Tool: mysql:8.0 client Job  (same image+mode as L4_02; works in this cluster)
+# Target Table: chosen per service via LUT (orders / trip)
+# Credentials: provided through the train-ticket-mysql-credentials Kubernetes Secret
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l4-slow-sql-injector
+  namespace: tt
+  labels:
+    chaos-layer: L4
+    chaos-type: slow-sql-injection
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L4
+        chaos-type: slow-sql-injection
+    spec:
+      serviceAccountName: chaos-runner
+      containers:
+        - name: slow-sql-injector
+          image: mysql:8.0
+          env:
+            - name: MYSQL_HOST
+              value: "tsdb-mysql-leader.tt.svc.cluster.local"
+            - name: MYSQL_PORT
+              value: "3306"
+            - name: MYSQL_DB
+              value: "ts"
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: train-ticket-mysql-credentials
+                  key: username
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: train-ticket-mysql-credentials
+                  key: password
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              : "${MYSQL_HOST:?MYSQL_HOST is required}"
+              : "${MYSQL_PORT:?MYSQL_PORT is required}"
+              : "${MYSQL_USER:?MYSQL_USER is required}"
+              : "${MYSQL_PASSWORD:?MYSQL_PASSWORD is required}"
+              : "${MYSQL_DB:?MYSQL_DB is required}"
+
+              # Lock duration in seconds (slightly less than the 120s injection
+              # window from exp.json so the recover_anomaly delete arrives after
+              # UNLOCK and not mid-transaction).
+              LOCK_DURATION=90
+
+              # TARGET_APP appears in two places below. inject_anomaly() in
+              # run_experiment.py does `sed 's/ts-order-service/<target>/g'`
+              # over the whole YAML, so the default 'ts-order-service' string
+              # below gets rewritten to whatever target_service is being run.
+              TARGET_APP="ts-order-service"
+
+              # Lock BOTH `orders` (ts-order primary table) AND `trip`
+              # (ts-travel primary table) simultaneously. Pilot showed that
+              # per-target single-table locking misses services that don't
+              # query that specific table — ts-seat queries neither `trip`
+              # only, so we widen to cover the three in-distribution targets
+              # uniformly. LOCK TABLES syntax allows multiple tables in one
+              # session; both are held until UNLOCK.
+              LOCK_TABLES_SPEC="\`orders\` WRITE, \`trip\` WRITE"
+
+              echo "=============================================="
+              echo "L4 ANOMALY: Slow SQL / Table Lock Injection"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "Target App: ${TARGET_APP}"
+              echo "Lock Spec: ${LOCK_TABLES_SPEC}"
+              echo "Lock Duration: ${LOCK_DURATION}s"
+              echo "MySQL: ${MYSQL_HOST}:${MYSQL_PORT}"
+              echo "=============================================="
+
+              # Sanity-check connectivity BEFORE locking. If auth wrong or
+              # tables missing, exit non-zero so the chaos pod fails visibly
+              # instead of silently doing nothing.
+              echo "[PROBE] Verifying access and table existence..."
+              mysql -h ${MYSQL_HOST} -P ${MYSQL_PORT} -u ${MYSQL_USER} \
+                    -p${MYSQL_PASSWORD} ${MYSQL_DB} \
+                    -e "SELECT COUNT(*) AS orders_rows FROM orders LIMIT 1; SELECT COUNT(*) AS trip_rows FROM trip LIMIT 1;" 2>&1
+              echo "[PROBE] OK"
+
+              echo "[INJECT] Acquiring WRITE locks on orders + trip..."
+              # Run the lock-and-hold sequence in a single mysql session.
+              # LOCK TABLES is session-scoped — released automatically when
+              # the session closes, so even if this Pod is killed mid-run
+              # the lock will release rather than leaking.
+              mysql -h ${MYSQL_HOST} -P ${MYSQL_PORT} -u ${MYSQL_USER} \
+                    -p${MYSQL_PASSWORD} ${MYSQL_DB} <<SQL
+              LOCK TABLES ${LOCK_TABLES_SPEC};
+              SELECT 'lock_acquired' AS status, NOW() AS at;
+              SELECT SLEEP(${LOCK_DURATION});
+              UNLOCK TABLES;
+              SELECT 'lock_released' AS status, NOW() AS at;
+              SQL
+
+              echo "[COMPLETE] Slow SQL injection finished at $(date -Iseconds)"
+      restartPolicy: Never

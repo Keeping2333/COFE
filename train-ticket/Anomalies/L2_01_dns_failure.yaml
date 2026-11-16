@@ -1,0 +1,192 @@
+# ==============================================================================
+# L2-01: DNS Resolution Failure (Network/Communication Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: Service discovery and DNS resolution
+#   Target Component: CoreDNS / kube-dns affecting ts-order-service
+#   Description: Simulates DNS resolution failures for a specific service.
+#                The target pod cannot resolve other service names, causing
+#                all outbound HTTP calls to fail with UnknownHostException.
+#                This mimics CoreDNS failures, network partitions, or 
+#                misconfigured DNS policies.
+#   Realism Score: HIGH - DNS issues are top-5 root causes in distributed systems
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: Logs + Metrics
+#     Expected Indicator:
+#       - Application logs: "java.net.UnknownHostException: ts-travel-service"
+#       - coredns_dns_request_duration_seconds shows errors
+#       - http_client_requests_seconds_count{status="5xx"} spikes
+#   Secondary Evidence:
+#     - Traces show: spans with error=true, missing downstream spans
+#     - K8s events: Pod may show "DNSConfigForming" issues
+#     - Dependent services show connection refused errors
+#
+# Duration: 90 seconds
+# Injection Method: Modify /etc/resolv.conf to use invalid DNS server
+# Target: ts-order-service pod
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l2-dns-failure-script
+  namespace: tt
+  labels:
+    chaos-layer: L2
+    chaos-type: dns-failure
+data:
+  inject.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Configuration
+    DURATION=${DURATION:-90}
+    TARGET_POD=${TARGET_POD:-""}
+    NAMESPACE=${NAMESPACE:-tt}
+    
+    echo "=============================================="
+    echo "L2 ANOMALY: DNS Resolution Failure Injection"
+    echo "=============================================="
+    echo "Start Time: $(date -Iseconds)"
+    echo "Duration: ${DURATION}s"
+    echo "Target Pod: ${TARGET_POD}"
+    echo "=============================================="
+    
+    if [ -z "$TARGET_POD" ]; then
+        echo "[ERROR] TARGET_POD environment variable not set"
+        exit 1
+    fi
+    
+    # Backup original resolv.conf
+    echo "[INJECT] Backing up original DNS configuration..."
+    kubectl exec -n ${NAMESPACE} ${TARGET_POD} -- \
+        cat /etc/resolv.conf > /tmp/resolv.conf.backup.${TARGET_POD}
+    
+    # Inject invalid DNS server
+    echo "[INJECT] Injecting invalid DNS server at $(date -Iseconds)"
+    kubectl exec -n ${NAMESPACE} ${TARGET_POD} -- \
+        sh -c 'echo "nameserver 192.0.2.1" > /etc/resolv.conf'
+    
+    echo "[INJECT] DNS failure active, waiting ${DURATION}s..."
+    sleep ${DURATION}
+    
+    # Restore original DNS
+    echo "[CLEANUP] Restoring original DNS configuration..."
+    cat /tmp/resolv.conf.backup.${TARGET_POD} | \
+        kubectl exec -n ${NAMESPACE} ${TARGET_POD} -i -- \
+        sh -c 'cat > /etc/resolv.conf'
+    
+    rm -f /tmp/resolv.conf.backup.${TARGET_POD}
+    
+    echo "[COMPLETE] DNS failure injection finished at $(date -Iseconds)"
+    
+  cleanup.sh: |
+    #!/bin/bash
+    NAMESPACE=${NAMESPACE:-tt}
+    TARGET_POD=${TARGET_POD:-""}
+    
+    echo "[CLEANUP] Attempting DNS restoration for ${TARGET_POD}..."
+    
+    if [ -f "/tmp/resolv.conf.backup.${TARGET_POD}" ]; then
+        cat /tmp/resolv.conf.backup.${TARGET_POD} | \
+            kubectl exec -n ${NAMESPACE} ${TARGET_POD} -i -- \
+            sh -c 'cat > /etc/resolv.conf'
+        rm -f /tmp/resolv.conf.backup.${TARGET_POD}
+    fi
+    
+    echo "[CLEANUP] Done"
+
+---
+# Job to execute DNS failure (runs from outside target pod)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l2-dns-failure-injector
+  namespace: tt
+  labels:
+    chaos-layer: L2
+    chaos-type: dns-failure
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L2
+        chaos-type: dns-failure
+    spec:
+      serviceAccountName: chaos-runner
+      containers:
+        - name: dns-failure-injector
+          image: bitnami/kubectl:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              # Find target pod
+              TARGET_POD=$(kubectl get pods -n tt -l app=ts-order-service -o jsonpath='{.items[0].metadata.name}')
+              echo "Target pod: ${TARGET_POD}"
+              
+              # Execute injection script inline
+              DURATION=90
+              NAMESPACE=tt
+              
+              echo "=============================================="
+              echo "L2 ANOMALY: DNS Resolution Failure Injection"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "Duration: ${DURATION}s"
+              echo "Target Pod: ${TARGET_POD}"
+              echo "=============================================="
+              
+              # Backup and inject
+              kubectl exec -n ${NAMESPACE} ${TARGET_POD} -- cat /etc/resolv.conf > /tmp/resolv.backup
+              kubectl exec -n ${NAMESPACE} ${TARGET_POD} -- sh -c 'echo "nameserver 192.0.2.1" > /etc/resolv.conf'
+              
+              echo "[INJECT] DNS failure active, waiting ${DURATION}s..."
+              sleep ${DURATION}
+              
+              # Restore
+              cat /tmp/resolv.backup | kubectl exec -n ${NAMESPACE} ${TARGET_POD} -i -- sh -c 'cat > /etc/resolv.conf'
+              
+              echo "[COMPLETE] DNS failure injection finished at $(date -Iseconds)"
+          env:
+            - name: DURATION
+              value: "90"
+      restartPolicy: Never
+
+---
+# ServiceAccount for chaos runner
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chaos-runner
+  namespace: tt
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: chaos-runner-role
+  namespace: tt
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec"]
+    verbs: ["get", "list", "create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: chaos-runner-binding
+  namespace: tt
+subjects:
+  - kind: ServiceAccount
+    name: chaos-runner
+    namespace: tt
+roleRef:
+  kind: Role
+  name: chaos-runner-role
+  apiGroup: rbac.authorization.k8s.io

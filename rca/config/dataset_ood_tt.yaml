@@ -1,0 +1,46 @@
+# ============================================================
+# Query-side dataset config for cross_domain diagnose on
+# round_tt_ood (18 experiments = 3 fault types ×
+# {ts-cancel-service, ts-execute-service} × 3).
+#
+# OOD axis = novel target services: ts-cancel-service /
+# ts-execute-service are held out from the round3 trained-on
+# set (ts-travel / ts-basic / ts-order / ...). Fault types
+# (network_latency / pod_kill / jvm_memory_pressure) and
+# labels are identical to round3, so no label mapping is
+# needed — cross_domain runs with identity labels.
+#
+# Only `dataset.path` differs from `dataset.yaml`. Encoder /
+# params (incl. mask_metric_channels) MUST stay identical so
+# the query failure vector matches the round3-trained encoder
+# input distribution. The evidence detector reads RAW channels
+# (bypasses the mask), so it still sees the clean OOD signal.
+# checkpoint_dir / kb_dir come from the source config (default
+# dataset.yaml).
+# ============================================================
+
+dataset:
+  type: locust
+
+  path: train-ticket/exp_runs/round_tt_ood
+
+  params:
+    max_traces_per_experiment: 200
+    max_spans_per_trace: 30
+    min_spans_per_trace: 2
+    metric_window_seconds: 60.0
+    num_metrics: 61
+    max_metric_points: 60
+    enable_rich_span_features: false
+    num_service_buckets: 64
+    num_operation_buckets: 1024
+    num_error_type_buckets: 32
+
+    mask_metric_channels:
+      - system_cpu_by_mode
+      - system_disk_io_bytes
+      - system_disk_operations
+      - system_disk_io_time
+      - system_disk_weighted_io_time
+      - network_io_bytes
+      - network_packets

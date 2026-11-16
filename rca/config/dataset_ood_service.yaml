@@ -1,0 +1,43 @@
+# ============================================================
+# Query-side dataset config for cross_domain diagnose on
+# round2_ood_service (24 experiments = 8 known fault types × 3
+# OOD target services: ts-cancel / ts-rebook / ts-execute).
+#
+# Only `dataset.path` differs from `dataset.yaml`. Encoder /
+# KB / params MUST stay identical so that the existing 6span
+# encoder forward pass matches the trained input shape.
+# ============================================================
+
+dataset:
+  type: locust
+
+  # OOD-by-target-service cohort. Same fault catalog as round2 train,
+  # but injected on services held out from the trained-on set.
+  path: train-ticket/exp_runs/round2_ood_service
+
+  params:
+    max_traces_per_experiment: 200
+    max_spans_per_trace: 30
+    min_spans_per_trace: 2
+    metric_window_seconds: 60.0
+    num_metrics: 60
+    max_metric_points: 60
+    enable_rich_span_features: false
+    num_service_buckets: 64
+    num_operation_buckets: 1024
+    num_error_type_buckets: 32
+
+model:
+  trace:
+    enable_rich_features: false
+    service_embed_dim: 16
+    operation_embed_dim: 32
+    status_embed_dim: 4
+    num_status_classes: 4
+    error_type_embed_dim: 8
+    num_otel_status_classes: 3
+    otel_status_embed_dim: 4
+
+# Source config (--config default = dataset.yaml) provides the
+# canonical checkpoint_dir + kb_dir. These are intentionally
+# omitted here.

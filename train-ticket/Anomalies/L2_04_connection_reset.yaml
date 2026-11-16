@@ -1,0 +1,190 @@
+# ==============================================================================
+# L2-04: TCP Connection Reset (Network/Communication Layer)  [OOD — new fault type]
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: TCP connection liveness — abrupt RST instead of drop/delay
+#   Target Component: Pod network namespace of ts-order-service
+#   Description: Injects TCP RST packets on inbound ESTABLISHED connections
+#                using iptables REJECT --reject-with tcp-reset. Existing
+#                connections are torn down with explicit RST (not silent drop),
+#                forcing immediate failure rather than timeout. Distinct from:
+#                - L2_01 (DNS NXDOMAIN)
+#                - L2_02 (added latency, packets still arrive)
+#                - L2_03 (random packet loss → retransmit + timeout)
+#   Realism Score: HIGH — Connection resets happen with NAT timeouts, LB
+#                health-check failures, kernel conntrack table overflow, or
+#                misbehaving middleboxes.
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: Metrics + Traces
+#     Expected Indicator:
+#       - network_connections_by_state: CLOSE_WAIT / FIN_WAIT spike
+#       - Trace error spans: "connection reset by peer" / "Connection reset"
+#       - http_request_rate drops sharply on existing keep-alive connections
+#   Secondary Evidence:
+#     - network_dropped does NOT increase (RST is sent, not dropped)
+#     - http_request_latency does NOT smoothly rise (failures are immediate)
+#     - App logs: "java.net.SocketException: Connection reset"
+#     - Differentiation from packet_loss (L2_03): instant fail vs. retries+timeout
+#
+# Duration: 90 seconds
+# Injection Method: nsenter into target pod netns + iptables REJECT tcp-reset
+# Target: Connections inbound to TARGET_APP (ts-order-service by default)
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l2-connection-reset-script
+  namespace: tt
+  labels:
+    chaos-layer: L2
+    chaos-type: connection-reset
+data:
+  inject.sh: |
+    #!/bin/bash
+    set -e
+
+    # Placeholder script — actual injection runs inside the Job container
+    # using nsenter (see Job spec). This ConfigMap exists for parity with
+    # other L2 anomalies and for future extraction.
+
+    echo "L2_04 inject.sh placeholder — see Job container for actual logic"
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l2-connection-reset-injector
+  namespace: tt
+  labels:
+    chaos-layer: L2
+    chaos-type: connection-reset
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L2
+        chaos-type: connection-reset
+    spec:
+      serviceAccountName: chaos-runner
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/hostname: train-ticket-worker
+      containers:
+        - name: connection-reset-injector
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              DURATION=90
+              TARGET_APP="ts-order-service"
+
+              echo "=============================================="
+              echo "L2 ANOMALY: TCP Connection Reset Injection"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "Target: ${TARGET_APP}"
+              echo "Duration: ${DURATION}s"
+              echo "=============================================="
+
+              # Install tools (util-linux provides nsenter; coreutils provides readlink)
+              apt-get update -qq && apt-get install -y -qq iptables util-linux procps coreutils
+
+              # Find the actual JVM process for the target service.
+              # IMPORTANT: cmdline-only match is unreliable — containerd-shim,
+              # pause containers, kubelet, etc. may also include the service
+              # name in their cmdline as metadata. Require:
+              #   1. cmdline contains ${TARGET_APP}
+              #   2. /proc/$pid/exe resolves to a java binary (not shim/pause)
+              # This produced "0% error" pilots in early L2_04 runs when a
+              # non-JVM process was selected (its netns had no inbound traffic).
+              echo "[INFO] Searching for JVM process serving ${TARGET_APP}..."
+
+              TARGET_PID=""
+              CANDIDATES=""
+              for pid in $(ls /host-proc | grep -E '^[0-9]+$'); do
+                  cmdline_file="/host-proc/$pid/cmdline"
+                  exe_link="/host-proc/$pid/exe"
+                  [ -f "$cmdline_file" ] || continue
+                  [ -L "$exe_link" ] || continue
+
+                  cmdline=$(cat "$cmdline_file" 2>/dev/null | tr '\0' ' ' || true)
+                  echo "$cmdline" | grep -q "${TARGET_APP}" 2>/dev/null || continue
+
+                  # Resolve exe; readlink may fail if we lack permission for this PID
+                  exe=$(readlink "$exe_link" 2>/dev/null || echo "")
+                  CANDIDATES="${CANDIDATES}\n  pid=$pid exe=$exe cmdline_excerpt=$(echo "$cmdline" | cut -c1-120)"
+
+                  case "$exe" in
+                      */java|*/jre/bin/java|*/jdk*/bin/java)
+                          TARGET_PID=$pid
+                          echo "[INFO] Selected target PID=$pid  exe=$exe"
+                          break
+                          ;;
+                  esac
+              done
+
+              if [ -z "$TARGET_PID" ]; then
+                  echo "[ERROR] No JVM process for ${TARGET_APP} found."
+                  echo "[ERROR] Candidates that matched cmdline but were not java:"
+                  printf "%b\n" "$CANDIDATES"
+                  exit 1
+              fi
+
+              echo "[INFO] Injecting RST rule into network namespace of PID ${TARGET_PID}"
+
+              # Insert iptables rule on INPUT chain: reject ESTABLISHED TCP
+              # traffic with explicit RST. This terminates existing connections
+              # and prevents new ones from completing handshake on app port.
+              # We scope to TCP only (preserve DNS over UDP for clarity of L2_04
+              # vs L2_01 DNS failure).
+              nsenter --target ${TARGET_PID} --net iptables -I INPUT 1 \
+                  -p tcp -m conntrack --ctstate ESTABLISHED \
+                  -j REJECT --reject-with tcp-reset
+
+              # Also reset NEW SYN packets to make the injection visible on
+              # both existing and new connections.
+              nsenter --target ${TARGET_PID} --net iptables -I INPUT 2 \
+                  -p tcp --syn \
+                  -j REJECT --reject-with tcp-reset
+
+              echo "[INJECT] iptables rules active in target namespace:"
+              nsenter --target ${TARGET_PID} --net iptables -L INPUT -n -v --line-numbers | head -20
+
+              echo "[INJECT] Connection reset injection active for ${DURATION}s..."
+              sleep ${DURATION}
+
+              # Cleanup — remove the inserted rules (delete by spec, idempotent).
+              echo "[CLEANUP] Removing iptables RST rules..."
+              nsenter --target ${TARGET_PID} --net iptables -D INPUT \
+                  -p tcp -m conntrack --ctstate ESTABLISHED \
+                  -j REJECT --reject-with tcp-reset 2>/dev/null || true
+              nsenter --target ${TARGET_PID} --net iptables -D INPUT \
+                  -p tcp --syn \
+                  -j REJECT --reject-with tcp-reset 2>/dev/null || true
+
+              echo "[CLEANUP] Final INPUT chain state:"
+              nsenter --target ${TARGET_PID} --net iptables -L INPUT -n -v --line-numbers | head -10
+
+              echo "[COMPLETE] Connection reset injection finished at $(date -Iseconds)"
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN", "SYS_ADMIN"]
+          volumeMounts:
+            - name: host-proc
+              mountPath: /host-proc
+              readOnly: true
+      volumes:
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+      restartPolicy: Never

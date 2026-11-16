@@ -1,0 +1,155 @@
+# ==============================================================================
+# L1-03: Node Memory Pressure (Infrastructure Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: Node-level memory exhaustion triggering OOM killer
+#   Target Component: Kubernetes node memory subsystem
+#   Description: Simulates memory pressure at the host level, potentially
+#                triggering the Linux OOM killer. This causes random pod
+#                terminations based on oom_score, mimicking memory leaks
+#                or under-provisioned nodes.
+#   Realism Score: HIGH - Memory exhaustion is the #1 cause of pod evictions
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: Metrics + K8s Events
+#     Expected Indicator:
+#       - node_memory_MemAvailable_bytes drops to near zero
+#       - node_vmstat_oom_kill counter increases
+#       - kubelet_evictions_total{eviction_signal="memory.available"} increases
+#   Secondary Evidence:
+#     - K8s events: "OOMKilled", "Evicted", "SystemOOM"
+#     - Application logs may show: "java.lang.OutOfMemoryError: Java heap space"
+#     - Pod restarts increase (check RESTARTS column)
+#     - Traces show incomplete spans (sudden termination)
+#
+# Duration: 60 seconds (careful: can cause pod evictions!)
+# Injection Tool: stress-ng (vm stressor)
+# Safety: Allocated 70% of available memory (configurable)
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l1-memory-pressure-script
+  namespace: tt
+  labels:
+    chaos-layer: L1
+    chaos-type: memory-pressure
+data:
+  inject.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Configuration
+    DURATION=${DURATION:-60}
+    MEMORY_PERCENT=${MEMORY_PERCENT:-70}
+    VM_WORKERS=${VM_WORKERS:-2}
+    
+    echo "=============================================="
+    echo "L1 ANOMALY: Node Memory Pressure Injection"
+    echo "=============================================="
+    echo "Start Time: $(date -Iseconds)"
+    echo "Duration: ${DURATION}s"
+    echo "Memory Target: ${MEMORY_PERCENT}% of available"
+    echo "VM Workers: ${VM_WORKERS}"
+    echo "=============================================="
+    
+    # Get available memory
+    AVAILABLE_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+    AVAILABLE_MB=$((AVAILABLE_KB / 1024))
+    TARGET_MB=$((AVAILABLE_MB * MEMORY_PERCENT / 100))
+    PER_WORKER_MB=$((TARGET_MB / VM_WORKERS))
+    
+    echo "[INFO] Available memory: ${AVAILABLE_MB}MB"
+    echo "[INFO] Target allocation: ${TARGET_MB}MB (${PER_WORKER_MB}MB per worker)"
+    
+    # Install stress-ng if not present
+    if ! command -v stress-ng &> /dev/null; then
+        echo "[INFO] Installing stress-ng..."
+        apt-get update -qq && apt-get install -y -qq stress-ng
+    fi
+    
+    echo "[INJECT] Starting memory stress at $(date -Iseconds)"
+    echo "[WARNING] This may trigger OOM killer and pod evictions!"
+    
+    # Run stress-ng with memory stressor
+    # --vm: virtual memory stressor
+    # --vm-bytes: amount per worker
+    # --vm-keep: keep allocated memory (don't release)
+    stress-ng --vm ${VM_WORKERS} \
+              --vm-bytes ${PER_WORKER_MB}M \
+              --vm-keep \
+              --timeout ${DURATION}s \
+              --metrics-brief \
+              --log-brief || true  # Don't fail if OOM killed
+    
+    echo "[COMPLETE] Memory stress finished at $(date -Iseconds)"
+    
+  cleanup.sh: |
+    #!/bin/bash
+    echo "[CLEANUP] Killing stress-ng processes..."
+    pkill -9 stress-ng || true
+    echo "[CLEANUP] Dropping caches to free memory..."
+    sync
+    echo 3 > /proc/sys/vm/drop_caches || true
+    echo "[CLEANUP] Done"
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: l1-memory-pressure-injector
+  namespace: tt
+  labels:
+    chaos-layer: L1
+    chaos-type: memory-pressure
+    chaos-experiment: active
+spec:
+  hostPID: true
+  hostNetwork: true
+  nodeSelector:
+    kubernetes.io/hostname: train-ticket-worker
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: memory-stress-injector
+      image: ubuntu:22.04
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          cp /scripts/inject.sh /tmp/inject.sh
+          chmod +x /tmp/inject.sh
+          /tmp/inject.sh
+      env:
+        - name: DURATION
+          value: "60"
+        - name: MEMORY_PERCENT
+          value: "70"
+        - name: VM_WORKERS
+          value: "2"
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: proc
+          mountPath: /proc
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "1000m"
+          memory: "24Gi"  # High limit to allow memory allocation
+  volumes:
+    - name: scripts
+      configMap:
+        name: l1-memory-pressure-script
+        defaultMode: 0755
+    - name: proc
+      hostPath:
+        path: /proc
+        type: Directory
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5

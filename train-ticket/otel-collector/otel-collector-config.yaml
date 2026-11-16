@@ -1,0 +1,357 @@
+# =============================================================================
+
+# =============================================================================
+
+#
+
+
+#                                        │
+#                                        ▼
+
+#                                        │
+#                                        ▼
+#                                   Exporters ──► monitoring host OTel Collector
+#                                             (<monitoring-private-ip>:4317)
+#
+
+
+
+
+
+# =============================================================================
+
+receivers:
+
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+
+  hostmetrics:
+    collection_interval: 15s
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      disk:
+      filesystem:
+      load:
+      network:
+      processes:
+
+
+
+  k8s_events:
+    namespaces: []
+
+
+
+
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: kube-state-metrics
+          scrape_interval: 15s
+          static_configs:
+            - targets:
+                - kube-state-metrics.kube-system.svc.cluster.local:8080
+        - job_name: coredns
+          scrape_interval: 15s
+          static_configs:
+            - targets:
+                - kube-dns.kube-system.svc.cluster.local:9153
+
+  # ==========================================================================
+
+  # ==========================================================================
+
+
+
+
+
+
+  filelog:
+    include:
+
+
+      - /hostfs/var/log/pods/tt_ts-*/ts-*/*.log
+    exclude:
+
+      - /hostfs/var/log/pods/tt_ts-*/opentelemetry-auto-instrumentation-java/*.log
+    start_at: end
+    include_file_path: true
+    include_file_name: false
+    
+    operators:
+
+
+      - type: regex_parser
+        regex: '^(?P<time>[^\s]+)\s+(?P<stream>stdout|stderr)\s+(?P<logtag>[^\s]*)\s+(?P<log>.*)$'
+        timestamp:
+          parse_from: attributes.time
+          layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+
+
+
+
+
+
+
+
+
+
+
+
+      - type: recombine
+        if: 'attributes.log != nil'
+        combine_field: attributes.log
+        is_first_entry: 'attributes.log matches "^\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}"'
+        source_identifier: attributes["log.file.path"]
+        combine_with: "\n"
+        force_emit_after: 5s
+        max_log_size: 1MiB
+
+
+
+      #   2025-12-17 04:08:21.294  INFO [0b23...a8de52a8,4e888aec1337ac19] 1 --- [io-12031-exec-9] order.controller.OrderController : [message]
+
+
+      - type: regex_parser
+        if: 'attributes.log != nil and attributes.log matches "^\\d{4}-\\d{2}-\\d{2}"'
+        parse_from: attributes.log
+        regex: '(?s)^(?P<app_timestamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+(?P<severity>\w+)\s+\[(?P<trace_id>[0-9a-fA-F]*),(?P<span_id>[0-9a-fA-F]*)\]\s+(?P<pid>\d+)\s+---\s+\[(?P<thread>[^\]]+)\]\s+(?P<logger>[^\s:]+)\s*:\s*(?P<message>.*)$'
+        on_error: send
+        severity:
+          parse_from: attributes.severity
+          mapping:
+            error: ERROR
+            warn: WARN
+            info: INFO
+            debug: DEBUG
+            trace: TRACE
+
+
+        trace:
+          trace_id:
+            parse_from: attributes.trace_id
+          span_id:
+            parse_from: attributes.span_id
+      
+
+
+      - type: regex_parser
+        if: 'attributes["log.file.path"] != nil'
+        parse_from: attributes["log.file.path"]
+        regex: '/hostfs/var/log/pods/(?P<k8s_namespace>[^_]+)_(?P<k8s_pod_name>[^_]+)_[^/]+/(?P<k8s_container_name>[^/]+)/\d+\.log$'
+        on_error: send
+      
+
+      - type: regex_parser
+        if: 'attributes.k8s_container_name != nil'
+        parse_from: attributes.k8s_container_name
+        regex: '^(?P<service_name>ts-[a-z-]+(-service)?)'
+        on_error: send
+      
+
+      - type: move
+        if: 'attributes.service_name != nil'
+        from: attributes.service_name
+        to: resource["service.name"]
+      
+
+      - type: move
+        if: 'attributes.k8s_namespace != nil'
+        from: attributes.k8s_namespace
+        to: resource["k8s.namespace.name"]
+      
+      - type: move
+        if: 'attributes.k8s_pod_name != nil'
+        from: attributes.k8s_pod_name
+        to: resource["k8s.pod.name"]
+      
+      - type: move
+        if: 'attributes.k8s_container_name != nil'
+        from: attributes.k8s_container_name
+        to: resource["k8s.container.name"]
+      
+
+
+      - type: move
+        if: 'attributes.message != nil'
+        from: attributes.message
+        to: body
+
+
+
+      - type: move
+        if: 'attributes.log != nil'
+        from: attributes.log
+        to: body
+
+
+      - type: remove
+        if: 'attributes.time != nil'
+        field: attributes.time
+
+      - type: remove
+        if: 'attributes.logtag != nil'
+        field: attributes.logtag
+
+      - type: remove
+        if: 'attributes.app_timestamp != nil'
+        field: attributes.app_timestamp
+
+processors:
+
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+
+
+  k8sattributes:
+    auth_type: "serviceAccount"
+    passthrough: false
+    extract:
+      metadata:
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.deployment.name
+        - k8s.namespace.name
+        - k8s.node.name
+        - k8s.pod.start_time
+        - k8s.replicaset.name
+        - k8s.replicaset.uid
+        - k8s.daemonset.name
+        - k8s.daemonset.uid
+        - k8s.job.name
+        - k8s.job.uid
+        - k8s.container.name
+      labels:
+        - tag_name: app
+          key: app
+          from: pod
+        - tag_name: service.name
+          key: app.kubernetes.io/name
+          from: pod
+        - tag_name: service.version
+          key: app.kubernetes.io/version
+          from: pod
+    pod_association:
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.ip
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.uid
+      - sources:
+          - from: connection
+
+
+  resource:
+    attributes:
+      - key: collector.name
+        value: train-ticket-otel-collector
+        action: upsert
+      - key: k8s.cluster.name
+        value: train-ticket-k8s
+        action: upsert
+      - key: deployment.environment
+        value: train-ticket-vm
+        action: upsert
+      - key: vm.role
+        value: worker-vm-a
+        action: upsert
+
+
+  resourcedetection:
+    detectors: [env, system]
+    timeout: 5s
+    override: false
+
+exporters:
+
+  debug:
+    verbosity: basic
+
+
+  otlp/central:
+    endpoint: "<monitoring-private-ip>:4317"
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+
+
+  file/logs:
+    path: /var/log/otel/logs.jsonl
+    format: json
+    rotation:
+      max_megabytes: 200
+      max_days: 7
+      max_backups: 20
+      localtime: false
+
+extensions:
+
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+
+  pprof:
+    endpoint: 0.0.0.0:1777
+
+service:
+  extensions: [health_check, pprof]
+
+  pipelines:
+
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resource, batch]
+      exporters: [otlp/central, debug]
+
+
+
+
+    # - prometheus:         kube-state-metrics (L3) + CoreDNS (L2 DNS) scraping
+    metrics:
+      receivers: [otlp, hostmetrics, prometheus]
+      processors: [memory_limiter, k8sattributes, resource, resourcedetection, batch]
+      exporters: [otlp/central, debug]
+
+
+
+
+
+
+    logs:
+      receivers: [otlp, k8s_events, filelog]
+      processors: [memory_limiter, k8sattributes, resource, batch]
+      exporters: [file/logs, debug]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 0.0.0.0:8888
+

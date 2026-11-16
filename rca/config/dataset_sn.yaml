@@ -1,0 +1,38 @@
+# ============================================================
+# SocialNetwork (round_sn2) dataset config.
+# Run any script with --config rca/config/dataset_sn.yaml.
+# system: sn selects _METRIC_FILES_SN / SN_FAULT_TYPE_TO_ID / SN LLM prompt.
+# round_sn2 enriches logs with service.name / container.name and drops
+# collector self-noise (round_sn1 had container-id-only, infra-only logs).
+# ============================================================
+
+dataset:
+  type: locust
+  path: social-network/exp_runs/batch/round_sn2
+  params:
+    system: sn
+    num_metrics: 27
+    max_traces_per_experiment: 200
+    max_spans_per_trace: 30
+    min_spans_per_trace: 2
+    metric_window_seconds: 60.0
+    max_metric_points: 60
+    enable_rich_span_features: false
+    num_service_buckets: 64
+    num_operation_buckets: 1024
+    num_error_type_buckets: 32
+    mask_metric_channels: []
+
+model:
+  trace:
+    enable_rich_features: false
+    service_embed_dim: 16
+    operation_embed_dim: 32
+    status_embed_dim: 4
+    num_status_classes: 4
+    error_type_embed_dim: 8
+    num_otel_status_classes: 3
+    otel_status_embed_dim: 4
+
+checkpoint_dir: checkpoints_sn
+kb_dir: knowledge_base_sn

@@ -1,0 +1,189 @@
+# ==============================================================================
+# L3-01: Pod Termination / CrashLoopBackOff (Platform Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: Kubernetes pod lifecycle management
+#   Target Component: ts-basic-service pod (critical dependency for many services)
+#   Description: Forcefully terminates a pod to trigger K8s self-healing.
+#                The deployment controller will recreate the pod, but during
+#                the restart window (~30-60s for Java services), dependent
+#                services will experience failures. This simulates OOMKill,
+#                node failures, or application crashes.
+#   Realism Score: HIGH - Pod restarts are extremely common in production
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: K8s Events + Metrics
+#     Expected Indicator:
+#       - K8s Event: "Killing container", "Pulled image", "Started container"
+#       - kube_pod_container_status_restarts_total increases
+#       - kube_pod_status_phase{phase="Pending"} temporarily increases
+#   Secondary Evidence:
+#     - Application logs from dependent services: "Connection refused"
+#       "feign.RetryableException: ts-basic-service: Connection refused"
+#     - Traces show errors when calling ts-basic-service
+#     - Metrics: http_server_requests_seconds_count{status="5xx"} spike
+#     - Nacos service registry shows instance deregistration
+#
+# Duration: Single kill (recovery takes 30-60s)
+# Injection Method: kubectl delete pod --force
+# Target: ts-basic-service pod
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l3-pod-kill-injector
+  namespace: tt
+  labels:
+    chaos-layer: L3
+    chaos-type: pod-kill
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L3
+        chaos-type: pod-kill
+    spec:
+      serviceAccountName: chaos-runner
+      containers:
+        - name: pod-killer
+          image: bitnami/kubectl:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              
+              TARGET_APP=${TARGET_APP:-ts-basic-service}
+              NAMESPACE=tt
+              KILL_COUNT=${KILL_COUNT:-1}
+              INTERVAL=${INTERVAL:-30}
+              
+              echo "=============================================="
+              echo "L3 ANOMALY: Pod Kill Injection"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "Target App: ${TARGET_APP}"
+              echo "Kill Count: ${KILL_COUNT}"
+              echo "Interval: ${INTERVAL}s between kills"
+              echo "=============================================="
+              
+              for i in $(seq 1 ${KILL_COUNT}); do
+                  # Find target pod
+                  TARGET_POD=$(kubectl get pods -n ${NAMESPACE} -l app=${TARGET_APP} \
+                      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+                  
+                  if [ -z "$TARGET_POD" ]; then
+                      echo "[ERROR] No pod found with label app=${TARGET_APP}"
+                      exit 1
+                  fi
+                  
+                  echo "[INJECT] Kill #${i}: Terminating pod ${TARGET_POD}..."
+                  
+                  # Record pre-kill state
+                  echo "[INFO] Pre-kill pod status:"
+                  kubectl get pod -n ${NAMESPACE} ${TARGET_POD} -o wide
+                  
+                  # Force delete the pod (grace period 0)
+                  kubectl delete pod -n ${NAMESPACE} ${TARGET_POD} \
+                      --force --grace-period=0
+                  
+                  echo "[INJECT] Pod ${TARGET_POD} terminated at $(date -Iseconds)"
+                  
+                  # Wait for recovery observation
+                  echo "[OBSERVE] Waiting for pod recovery..."
+                  sleep 5
+                  
+                  # Show new pod status
+                  echo "[INFO] Post-kill pod status:"
+                  kubectl get pods -n ${NAMESPACE} -l app=${TARGET_APP} -o wide
+                  
+                  # Wait for pod to be ready
+                  echo "[OBSERVE] Waiting for new pod to become ready..."
+                  kubectl wait --for=condition=ready pod -n ${NAMESPACE} \
+                      -l app=${TARGET_APP} --timeout=120s || true
+                  
+                  NEW_POD=$(kubectl get pods -n ${NAMESPACE} -l app=${TARGET_APP} \
+                      -o jsonpath='{.items[0].metadata.name}')
+                  echo "[INFO] New pod ${NEW_POD} is ready"
+                  
+                  if [ $i -lt ${KILL_COUNT} ]; then
+                      echo "[INFO] Waiting ${INTERVAL}s before next kill..."
+                      sleep ${INTERVAL}
+                  fi
+              done
+              
+              echo "[COMPLETE] Pod kill injection finished at $(date -Iseconds)"
+          env:
+            - name: TARGET_APP
+              value: "ts-basic-service"
+            - name: KILL_COUNT
+              value: "1"
+            - name: INTERVAL
+              value: "30"
+      restartPolicy: Never
+
+---
+# Alternative: Repeated kills to simulate CrashLoopBackOff pattern
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l3-crashloop-simulation
+  namespace: tt
+  labels:
+    chaos-layer: L3
+    chaos-type: crashloop
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L3
+        chaos-type: crashloop
+    spec:
+      serviceAccountName: chaos-runner
+      containers:
+        - name: crashloop-simulator
+          image: bitnami/kubectl:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              
+              TARGET_APP=ts-basic-service
+              NAMESPACE=tt
+              KILL_COUNT=3
+              
+              echo "=============================================="
+              echo "L3 ANOMALY: CrashLoop Simulation"
+              echo "=============================================="
+              echo "Target: ${TARGET_APP}"
+              echo "Rapid kills: ${KILL_COUNT}"
+              echo "=============================================="
+              
+              # Kill pod multiple times rapidly to simulate CrashLoopBackOff
+              for i in $(seq 1 ${KILL_COUNT}); do
+                  TARGET_POD=$(kubectl get pods -n ${NAMESPACE} -l app=${TARGET_APP} \
+                      --field-selector=status.phase=Running \
+                      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+                  
+                  if [ -n "$TARGET_POD" ]; then
+                      echo "[INJECT] Kill #${i}: ${TARGET_POD}"
+                      kubectl delete pod -n ${NAMESPACE} ${TARGET_POD} --force --grace-period=0
+                  fi
+                  
+                  # Short wait to let pod restart
+                  sleep 10
+              done
+              
+              echo "[OBSERVE] Final pod status:"
+              kubectl get pods -n ${NAMESPACE} -l app=${TARGET_APP}
+              kubectl get events -n ${NAMESPACE} --field-selector involvedObject.name=${TARGET_POD} --sort-by='.lastTimestamp' | tail -10
+              
+              echo "[COMPLETE] CrashLoop simulation finished"
+      restartPolicy: Never

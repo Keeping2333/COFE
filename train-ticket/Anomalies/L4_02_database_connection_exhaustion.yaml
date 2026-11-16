@@ -1,0 +1,199 @@
+# ==============================================================================
+# L4-02: Database Connection Pool Exhaustion (Application Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: Application database connectivity (HikariCP pool)
+#   Target Component: ts-order-service -> MySQL connection pool
+#   Description: Exhausts the HikariCP connection pool by executing slow queries
+#                or holding connections. When the pool is exhausted, new requests
+#                queue and eventually timeout. This simulates connection leaks,
+#                slow queries, or database overload.
+#   Realism Score: HIGH - Connection pool exhaustion is a classic production issue
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: Metrics + Logs
+#     Expected Indicator:
+#       - hikaricp_connections_active approaches hikaricp_connections_max
+#       - hikaricp_connections_pending increases
+#       - hikaricp_connections_timeout_total increases
+#   Secondary Evidence:
+#     - Application logs: "Connection is not available, request timed out"
+#       "HikariPool-1 - Connection not available"
+#     - MySQL metrics: Threads_connected increases
+#     - Traces show database spans with long wait times
+#     - HTTP responses return 5xx with "Unable to acquire connection"
+#
+# Duration: 90 seconds
+# Injection Method: MySQL slow query lock / direct connection holding
+# Target: tsdb-mysql -> ts-order-service
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l4-db-connection-script
+  namespace: tt
+  labels:
+    chaos-layer: L4
+    chaos-type: db-connection-exhaustion
+data:
+  inject-slow-query.sql: |
+    -- This query holds a lock and runs slowly
+    -- Run from MySQL pod: mysql -u root ts < inject-slow-query.sql
+    
+    -- Create a lock that blocks other transactions
+    START TRANSACTION;
+    
+    -- Select with FOR UPDATE to hold row locks
+    SELECT * FROM orders WHERE 1=1 FOR UPDATE;
+    
+    -- Sleep to hold the lock (in a real scenario)
+    -- SELECT SLEEP(60);
+    
+    -- Note: You'd need to run multiple connections to exhaust the pool
+    
+  exhaust-connections.sh: |
+    #!/bin/bash
+    set -e
+    
+    MYSQL_HOST=${MYSQL_HOST:-"tsdb-mysql-leader.tt.svc.cluster.local"}
+    MYSQL_PORT=${MYSQL_PORT:-3306}
+    MYSQL_USER=${MYSQL_USER:-root}
+    MYSQL_DB=${MYSQL_DB:-ts}
+    CONNECTION_COUNT=${CONNECTION_COUNT:-20}
+    DURATION=${DURATION:-90}
+    
+    echo "=============================================="
+    echo "L4 ANOMALY: DB Connection Pool Exhaustion"
+    echo "=============================================="
+    echo "Start Time: $(date -Iseconds)"
+    echo "MySQL Host: ${MYSQL_HOST}:${MYSQL_PORT}"
+    echo "Connections to open: ${CONNECTION_COUNT}"
+    echo "Duration: ${DURATION}s"
+    echo "=============================================="
+    
+    # Install MySQL client
+    apt-get update -qq && apt-get install -y -qq mysql-client
+    
+    echo "[INJECT] Opening ${CONNECTION_COUNT} long-running connections..."
+    
+    # Open multiple connections with long-running queries
+    for i in $(seq 1 ${CONNECTION_COUNT}); do
+        mysql -h ${MYSQL_HOST} -P ${MYSQL_PORT} -u ${MYSQL_USER} ${MYSQL_DB} \
+            -e "SELECT SLEEP(${DURATION})" &
+        echo "[INJECT] Connection $i opened"
+        sleep 0.5
+    done
+    
+    echo "[INFO] ${CONNECTION_COUNT} connections holding..."
+    echo "[INFO] Monitor HikariCP metrics: hikaricp_connections_pending"
+    
+    # Wait for connections to complete
+    wait
+    
+    echo "[COMPLETE] DB connection exhaustion finished at $(date -Iseconds)"
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l4-db-connection-exhaustion
+  namespace: tt
+  labels:
+    chaos-layer: L4
+    chaos-type: db-connection-exhaustion
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L4
+        chaos-type: db-connection-exhaustion
+    spec:
+      containers:
+        - name: connection-exhauster
+          image: mysql:8.0
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              
+              MYSQL_HOST="tsdb-mysql-leader.tt.svc.cluster.local"
+              MYSQL_PORT=3306
+              MYSQL_USER=root
+              MYSQL_DB=ts
+              CONNECTION_COUNT=15
+              DURATION=90
+              
+              echo "=============================================="
+              echo "L4 ANOMALY: DB Connection Pool Exhaustion"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "MySQL: ${MYSQL_HOST}:${MYSQL_PORT}"
+              echo "Connections: ${CONNECTION_COUNT}"
+              echo "Duration: ${DURATION}s"
+              echo "=============================================="
+              
+              echo "[INFO] Testing MySQL connectivity..."
+              mysql -h ${MYSQL_HOST} -P ${MYSQL_PORT} -u ${MYSQL_USER} ${MYSQL_DB} \
+                  -e "SELECT 'Connected' as status;" || {
+                  echo "[ERROR] Cannot connect to MySQL"
+                  exit 1
+              }
+              
+              echo "[INFO] Current MySQL connections:"
+              mysql -h ${MYSQL_HOST} -P ${MYSQL_PORT} -u ${MYSQL_USER} -e \
+                  "SHOW STATUS LIKE 'Threads_connected';"
+              
+              echo "[INJECT] Opening ${CONNECTION_COUNT} connections with SLEEP..."
+              
+              # Open multiple long-running connections
+              for i in $(seq 1 ${CONNECTION_COUNT}); do
+                  mysql -h ${MYSQL_HOST} -P ${MYSQL_PORT} -u ${MYSQL_USER} ${MYSQL_DB} \
+                      -e "SELECT SLEEP(${DURATION})" 2>/dev/null &
+                  echo "  Connection $i started (PID: $!)"
+              done
+              
+              echo "[INJECT] Waiting 10s for connections to establish..."
+              sleep 10
+              
+              echo "[MONITOR] Current MySQL connections:"
+              mysql -h ${MYSQL_HOST} -P ${MYSQL_PORT} -u ${MYSQL_USER} -e \
+                  "SHOW STATUS LIKE 'Threads_connected';" || true
+              
+              echo "[INFO] Connections holding for remaining ~$((DURATION-10))s"
+              echo "[INFO] Test API calls to ts-order-service now to see pool exhaustion"
+              
+              # Wait for all background jobs
+              wait
+              
+              echo "[COMPLETE] DB connection exhaustion finished at $(date -Iseconds)"
+      restartPolicy: Never
+
+---
+# Alternative: Cause slow queries via table lock
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l4-table-lock-script
+  namespace: tt
+  labels:
+    chaos-layer: L4
+    chaos-type: table-lock
+data:
+  lock-tables.sh: |
+    #!/bin/bash
+    # Lock orders table to block all writes
+    # This causes connection pool backup
+    
+    MYSQL_HOST="tsdb-mysql-leader.tt.svc.cluster.local"
+    DURATION=${1:-60}
+    
+    mysql -h ${MYSQL_HOST} -u root ts << EOF
+    LOCK TABLES orders WRITE;
+    SELECT SLEEP(${DURATION});
+    UNLOCK TABLES;
+    EOF

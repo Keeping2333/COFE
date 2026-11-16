@@ -1,0 +1,176 @@
+# ==============================================================================
+# L3-03: Resource Quota Exhaustion (Platform Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: Kubernetes resource scheduling and quota management
+#   Target Component: Namespace-level resource quotas in tt namespace
+#   Description: Creates a restrictive ResourceQuota that prevents new pods
+#                from scheduling. Existing pods continue running, but any
+#                scaling events, rolling updates, or pod restarts will fail.
+#                This simulates capacity planning failures or quota misconfigs.
+#   Realism Score: MEDIUM - Common in multi-tenant K8s environments
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: K8s Events
+#     Expected Indicator:
+#       - Event: "exceeded quota: tt-chaos-quota"
+#       - Event: "FailedCreate" on ReplicaSet
+#       - kube_resourcequota metrics show limit reached
+#   Secondary Evidence:
+#     - Deployment shows unavailable replicas
+#     - HPA scaling events fail
+#     - Pod deletion followed by "Pending" state
+#     - `kubectl describe quota` shows quota exceeded
+#
+# Duration: 120 seconds
+# Injection Method: Apply restrictive ResourceQuota
+# Target: tt namespace (affects all new pods)
+# ==============================================================================
+
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tt-chaos-quota
+  namespace: tt
+  labels:
+    chaos-layer: L3
+    chaos-type: quota-exhaustion
+    chaos-experiment: active
+spec:
+  hard:
+    # Set quota slightly below current usage to block new pods
+    # Current usage: ~8 cores, ~20GB memory
+    requests.cpu: "100m"      # Extremely low - blocks new pods
+    requests.memory: "128Mi"  # Extremely low - blocks new pods
+    limits.cpu: "200m"
+    limits.memory: "256Mi"
+    pods: "1"                 # Only allow 1 new pod total
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l3-quota-exhaustion-injector
+  namespace: tt
+  labels:
+    chaos-layer: L3
+    chaos-type: quota-exhaustion
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L3
+        chaos-type: quota-exhaustion
+    spec:
+      serviceAccountName: chaos-runner
+      containers:
+        - name: quota-injector
+          image: bitnami/kubectl:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              
+              DURATION=${DURATION:-120}
+              NAMESPACE=tt
+              QUOTA_NAME="tt-chaos-quota"
+              
+              echo "=============================================="
+              echo "L3 ANOMALY: Resource Quota Exhaustion"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "Duration: ${DURATION}s"
+              echo "Namespace: ${NAMESPACE}"
+              echo "=============================================="
+              
+              # Show current resource usage
+              echo "[INFO] Current namespace resource usage:"
+              kubectl describe namespace ${NAMESPACE} | grep -A 20 "Resource Quotas" || true
+              
+              # Apply restrictive quota
+              echo "[INJECT] Applying restrictive resource quota..."
+              cat <<EOF | kubectl apply -f -
+              apiVersion: v1
+              kind: ResourceQuota
+              metadata:
+                name: ${QUOTA_NAME}
+                namespace: ${NAMESPACE}
+                labels:
+                  chaos-layer: L3
+                  chaos-type: quota-exhaustion
+              spec:
+                hard:
+                  requests.cpu: "100m"
+                  requests.memory: "128Mi"
+                  pods: "1"
+              EOF
+              
+              echo "[INFO] Quota applied:"
+              kubectl describe quota ${QUOTA_NAME} -n ${NAMESPACE}
+              
+              # Trigger a scaling event to demonstrate failure
+              echo "[INJECT] Triggering test: scaling ts-basic-service to 2 replicas..."
+              ORIGINAL_REPLICAS=$(kubectl get deployment ts-basic-service -n ${NAMESPACE} -o jsonpath='{.spec.replicas}')
+              
+              kubectl scale deployment ts-basic-service -n ${NAMESPACE} --replicas=2 || true
+              
+              sleep 10
+              
+              echo "[OBSERVE] Checking for quota-related events:"
+              kubectl get events -n ${NAMESPACE} --sort-by='.lastTimestamp' | grep -i quota | tail -10 || echo "No quota events yet"
+              
+              echo "[OBSERVE] Checking ReplicaSet status:"
+              kubectl get rs -n ${NAMESPACE} -l app=ts-basic-service
+              
+              echo "[INJECT] Quota exhaustion active, waiting ${DURATION}s..."
+              sleep $((DURATION - 10))
+              
+              # Cleanup
+              echo "[CLEANUP] Removing restrictive quota..."
+              kubectl delete resourcequota ${QUOTA_NAME} -n ${NAMESPACE} --ignore-not-found
+              
+              echo "[CLEANUP] Restoring original replica count..."
+              kubectl scale deployment ts-basic-service -n ${NAMESPACE} --replicas=${ORIGINAL_REPLICAS}
+              
+              echo "[COMPLETE] Quota exhaustion injection finished at $(date -Iseconds)"
+          env:
+            - name: DURATION
+              value: "120"
+      restartPolicy: Never
+
+---
+# Role extension for quota management
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: chaos-quota-role
+  namespace: tt
+rules:
+  - apiGroups: [""]
+    resources: ["resourcequotas", "namespaces"]
+    verbs: ["get", "list", "create", "delete", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale", "replicasets"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: chaos-quota-binding
+  namespace: tt
+subjects:
+  - kind: ServiceAccount
+    name: chaos-runner
+    namespace: tt
+roleRef:
+  kind: Role
+  name: chaos-quota-role
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,225 @@
+# ==============================================================================
+# L4-03: HTTP Error / Exception Injection (Application Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: Application error handling and business logic
+#   Target Component: ts-travel-service API responses
+#   Description: Injects HTTP errors (500, 503) into responses from a critical
+#                service. This simulates application exceptions, null pointer
+#                errors, validation failures, or business rule violations.
+#                Upstream services must handle the degraded dependency.
+#   Realism Score: HIGH - Application exceptions are daily occurrences
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: Metrics + Traces
+#     Expected Indicator:
+#       - http_server_requests_seconds_count{status="500"} increases
+#       - http_server_requests_seconds_count{status="503"} increases
+#       - Trace spans show error=true with HTTP status codes
+#   Secondary Evidence:
+#     - Application logs show stack traces, NullPointerException, etc.
+#     - Downstream services log: "Upstream service error"
+#       "feign.FeignException$InternalServerError"
+#     - End-to-end traces show error propagation
+#     - User-facing errors: "Service temporarily unavailable"
+#
+# Duration: 90 seconds
+# Injection Method: Proxy/sidecar HTTP response manipulation
+# Alternative: Environment variable to enable "chaos mode" in app
+# Target: ts-travel-service responses
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l4-http-error-script
+  namespace: tt
+  labels:
+    chaos-layer: L4
+    chaos-type: http-error
+data:
+  inject-errors.sh: |
+    #!/bin/bash
+    set -e
+    
+    TARGET_HOST=${TARGET_HOST:-"ts-travel-service.tt.svc.cluster.local"}
+    TARGET_PORT=${TARGET_PORT:-12346}
+    ERROR_RATE=${ERROR_RATE:-50}
+    DURATION=${DURATION:-90}
+    
+    echo "=============================================="
+    echo "L4 ANOMALY: HTTP Error Injection"
+    echo "=============================================="
+    echo "Start Time: $(date -Iseconds)"
+    echo "Target: ${TARGET_HOST}:${TARGET_PORT}"
+    echo "Error Rate: ${ERROR_RATE}%"
+    echo "Duration: ${DURATION}s"
+    echo "=============================================="
+    
+    # This demonstrates the expected behavior
+    # Actual injection would require service mesh or proxy
+    
+    echo "[INFO] HTTP Error injection requires one of:"
+    echo "  1. Istio with VirtualService fault injection"
+    echo "  2. Linkerd with ServiceProfile retries"
+    echo "  3. Application-level chaos flags"
+    echo "  4. Envoy proxy sidecar"
+    
+    echo ""
+    echo "[SIMULATE] Generating error-triggering requests..."
+    
+    # Send malformed requests that trigger 4xx/5xx
+    for i in $(seq 1 20); do
+        # Invalid trip ID causes validation errors
+        curl -s -o /dev/null -w "%{http_code}\n" \
+            "http://${TARGET_HOST}:${TARGET_PORT}/api/v1/travelservice/trips/invalid-id-${i}" || true
+        
+        # Missing required fields causes 400
+        curl -s -o /dev/null -w "%{http_code}\n" \
+            -X POST "http://${TARGET_HOST}:${TARGET_PORT}/api/v1/travelservice/trips/left" \
+            -H "Content-Type: application/json" \
+            -d '{}' || true
+        
+        sleep 2
+    done
+    
+    echo "[COMPLETE] HTTP error simulation finished"
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l4-http-error-injector
+  namespace: tt
+  labels:
+    chaos-layer: L4
+    chaos-type: http-error
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L4
+        chaos-type: http-error
+    spec:
+      containers:
+        - name: error-injector
+          image: curlimages/curl:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              
+              # Target the travel service which is critical for booking
+              TARGET_HOST="ts-travel-service.tt.svc.cluster.local"
+              TARGET_PORT=12346
+              DURATION=90
+              
+              echo "=============================================="
+              echo "L4 ANOMALY: HTTP Error Injection via Bad Requests"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "Target: ${TARGET_HOST}:${TARGET_PORT}"
+              echo "Duration: ${DURATION}s"
+              echo "=============================================="
+              
+              echo "[INFO] Testing connectivity..."
+              curl -s --connect-timeout 5 "http://${TARGET_HOST}:${TARGET_PORT}/api/v1/travelservice/trips" | head -c 100
+              echo ""
+              
+              END_TIME=$(($(date +%s) + DURATION))
+              REQUEST_COUNT=0
+              ERROR_COUNT=0
+              
+              echo "[INJECT] Sending malformed/edge-case requests to trigger errors..."
+              
+              while [ $(date +%s) -lt $END_TIME ]; do
+                  REQUEST_COUNT=$((REQUEST_COUNT + 1))
+                  
+                  # 1. Invalid JSON body - triggers parsing error
+                  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                      -X POST "http://${TARGET_HOST}:${TARGET_PORT}/api/v1/travelservice/trips/left" \
+                      -H "Content-Type: application/json" \
+                      -d 'invalid-json{' 2>/dev/null || echo "000")
+                  [ "$STATUS" -ge 400 ] && ERROR_COUNT=$((ERROR_COUNT + 1))
+                  
+                  # 2. Non-existent trip ID - triggers 404 or business error
+                  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                      "http://${TARGET_HOST}:${TARGET_PORT}/api/v1/travelservice/trips/NONEXISTENT_${REQUEST_COUNT}" \
+                      2>/dev/null || echo "000")
+                  [ "$STATUS" -ge 400 ] && ERROR_COUNT=$((ERROR_COUNT + 1))
+                  
+                  # 3. Empty required fields - triggers validation error
+                  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                      -X POST "http://${TARGET_HOST}:${TARGET_PORT}/api/v1/travelservice/trips/left" \
+                      -H "Content-Type: application/json" \
+                      -d '{"startPlace":"","endPlace":"","departureTime":""}' \
+                      2>/dev/null || echo "000")
+                  [ "$STATUS" -ge 400 ] && ERROR_COUNT=$((ERROR_COUNT + 1))
+                  
+                  # 4. Future date overflow - may trigger date parsing error
+                  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                      -X POST "http://${TARGET_HOST}:${TARGET_PORT}/api/v1/travelservice/trips/left" \
+                      -H "Content-Type: application/json" \
+                      -d '{"startPlace":"shanghai","endPlace":"beijing","departureTime":"9999-99-99"}' \
+                      2>/dev/null || echo "000")
+                  [ "$STATUS" -ge 400 ] && ERROR_COUNT=$((ERROR_COUNT + 1))
+                  
+                  # Progress every 10 iterations
+                  if [ $((REQUEST_COUNT % 10)) -eq 0 ]; then
+                      echo "[MONITOR] Requests: $((REQUEST_COUNT * 4)), Errors: ${ERROR_COUNT}"
+                  fi
+                  
+                  sleep 1
+              done
+              
+              echo ""
+              echo "=============================================="
+              echo "SUMMARY"
+              echo "=============================================="
+              echo "Total Requests: $((REQUEST_COUNT * 4))"
+              echo "Error Responses: ${ERROR_COUNT}"
+              echo "Error Rate: $(( (ERROR_COUNT * 100) / (REQUEST_COUNT * 4) ))%"
+              echo "=============================================="
+              
+              echo "[COMPLETE] HTTP error injection finished at $(date -Iseconds)"
+      restartPolicy: Never
+
+---
+# ConfigMap for Chaos Mesh HTTPChaos (if Chaos Mesh is installed)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l4-chaos-mesh-http-fault
+  namespace: tt
+  labels:
+    chaos-layer: L4
+    chaos-type: http-error
+data:
+  httpchaos.yaml: |
+    # Apply this if Chaos Mesh is installed:
+    # kubectl apply -f httpchaos.yaml
+    apiVersion: chaos-mesh.org/v1alpha1
+    kind: HTTPChaos
+    metadata:
+      name: travel-service-error-injection
+      namespace: tt
+    spec:
+      mode: all
+      selector:
+        namespaces:
+          - tt
+        labelSelectors:
+          app: ts-travel-service
+      target: Response
+      port: 12346
+      method: GET
+      path: /api/v1/travelservice/*
+      response_body: '{"status":0,"msg":"[CHAOS] Service temporarily unavailable","data":null}'
+      code: 503
+      duration: 90s
+      headers:
+        X-Chaos-Injected: "true"

@@ -1,0 +1,206 @@
+# ==============================================================================
+# L4-01: JVM Heap Memory Pressure / GC Pauses (Application Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: JVM runtime and garbage collection
+#   Target Component: ts-order-service JVM heap
+#   Description: Triggers JVM memory pressure by allocating objects that fill
+#                the heap, causing frequent GC cycles and potential GC pauses.
+#                This simulates memory leaks, large result sets, or inefficient
+#                caching. The application remains running but becomes slow.
+#   Realism Score: HIGH - Memory leaks are the #1 Java application issue
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: Metrics (JVM)
+#     Expected Indicator:
+#       - jvm_memory_used_bytes{area="heap"} approaches jvm_memory_max_bytes
+#       - jvm_gc_pause_seconds_sum increases dramatically
+#       - jvm_gc_pause_seconds_count shows frequent GC events
+#       - jvm_gc_memory_promoted_bytes_total spikes
+#   Secondary Evidence:
+#     - Application logs: "GC overhead limit exceeded" or long pause warnings
+#     - Response times increase (visible in traces)
+#     - Traces show spans with unusually long durations
+#     - Eventually: "java.lang.OutOfMemoryError: Java heap space"
+#
+# Duration: 60 seconds of memory pressure
+# Injection Method: Byteman/Java agent memory allocation script
+# Alternative: HTTP endpoint that triggers memory allocation
+# Target: ts-order-service
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l4-jvm-memory-script
+  namespace: tt
+  labels:
+    chaos-layer: L4
+    chaos-type: jvm-memory
+data:
+  # Byteman rule to inject memory pressure
+  memory-pressure.btm: |
+    # Byteman rule: Allocate memory on each order query
+    RULE allocate memory on order query
+    CLASS order.service.OrderServiceImpl
+    METHOD getAllOrders
+    AT ENTRY
+    IF TRUE
+    DO
+      System.out.println("[CHAOS] Triggering memory allocation");
+      createList(10000000)
+    ENDRULE
+    
+    HELPER chaos.MemoryHelper
+    
+  # Shell script for direct memory pressure via HTTP
+  trigger-memory.sh: |
+    #!/bin/bash
+    set -e
+    
+    TARGET_HOST=${TARGET_HOST:-"ts-order-service.tt.svc.cluster.local"}
+    TARGET_PORT=${TARGET_PORT:-12031}
+    DURATION=${DURATION:-60}
+    INTERVAL=${INTERVAL:-2}
+    
+    echo "=============================================="
+    echo "L4 ANOMALY: JVM Memory Pressure Injection"
+    echo "=============================================="
+    echo "Start Time: $(date -Iseconds)"
+    echo "Target: ${TARGET_HOST}:${TARGET_PORT}"
+    echo "Duration: ${DURATION}s"
+    echo "=============================================="
+    
+    # Install curl
+    apt-get update -qq && apt-get install -y -qq curl
+    
+    echo "[INJECT] Triggering repeated heavy API calls to cause memory pressure..."
+    
+    END_TIME=$(($(date +%s) + DURATION))
+    
+    while [ $(date +%s) -lt $END_TIME ]; do
+        # Call endpoints that return large result sets
+        # This fills JVM heap with response objects
+        curl -s "http://${TARGET_HOST}:${TARGET_PORT}/api/v1/orderservice/order" \
+            -H "Content-Type: application/json" \
+            -o /dev/null || true
+        
+        curl -s "http://${TARGET_HOST}:${TARGET_PORT}/api/v1/orderservice/order/refresh" \
+            -H "Content-Type: application/json" \
+            -d '{"loginId":"admin","enableStateQuery":false,"enableTravelDateQuery":false,"enableBoughtDateQuery":false,"travelDateStart":null,"travelDateEnd":null,"boughtDateStart":null,"boughtDateEnd":null}' \
+            -o /dev/null || true
+        
+        sleep ${INTERVAL}
+    done
+    
+    echo "[COMPLETE] Memory pressure injection finished at $(date -Iseconds)"
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l4-jvm-memory-pressure
+  namespace: tt
+  labels:
+    chaos-layer: L4
+    chaos-type: jvm-memory
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L4
+        chaos-type: jvm-memory
+    spec:
+      containers:
+        - name: memory-pressure-trigger
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              
+              TARGET_HOST="ts-order-service.tt.svc.cluster.local"
+              TARGET_PORT=12031
+              DURATION=60
+              CONCURRENT=5
+              
+              echo "=============================================="
+              echo "L4 ANOMALY: JVM Memory Pressure via API Load"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "Target: ${TARGET_HOST}:${TARGET_PORT}"
+              echo "Duration: ${DURATION}s"
+              echo "Concurrent requests: ${CONCURRENT}"
+              echo "=============================================="
+              
+              # Install tools
+              apt-get update -qq && apt-get install -y -qq curl parallel
+              
+              echo "[INFO] Checking connectivity..."
+              curl -s --connect-timeout 5 "http://${TARGET_HOST}:${TARGET_PORT}/api/v1/orderservice/order" \
+                  -H "Content-Type: application/json" | head -c 200
+              echo ""
+              
+              echo "[INJECT] Starting parallel requests to trigger memory allocation..."
+              
+              # Create request script
+              cat > /tmp/request.sh << 'SCRIPT'
+              TARGET_HOST=$1
+              TARGET_PORT=$2
+              
+              while true; do
+                  # Large query that creates many objects
+                  curl -s "http://${TARGET_HOST}:${TARGET_PORT}/api/v1/orderservice/order/refresh" \
+                      -H "Content-Type: application/json" \
+                      -d '{"loginId":"admin","enableStateQuery":false,"enableTravelDateQuery":false}' \
+                      -o /dev/null
+                  
+                  # Small delay
+                  sleep 0.5
+              done
+              SCRIPT
+              chmod +x /tmp/request.sh
+              
+              # Run parallel requests
+              for i in $(seq 1 ${CONCURRENT}); do
+                  /tmp/request.sh ${TARGET_HOST} ${TARGET_PORT} &
+              done
+              
+              # Wait for duration
+              echo "[INJECT] Memory pressure active via ${CONCURRENT} parallel clients..."
+              sleep ${DURATION}
+              
+              # Kill background jobs
+              jobs -p | xargs -r kill 2>/dev/null || true
+              
+              echo "[COMPLETE] JVM memory pressure finished at $(date -Iseconds)"
+      restartPolicy: Never
+
+---
+# Alternative: Direct heap pressure via pod exec
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l4-heap-dump-trigger
+  namespace: tt
+  labels:
+    chaos-layer: L4
+    chaos-type: jvm-heap-analysis
+data:
+  analyze-heap.sh: |
+    #!/bin/bash
+    # Trigger heap analysis (causes GC pause)
+    # Run: kubectl exec -n tt <pod> -- jcmd 1 GC.run
+    
+    TARGET_POD=$1
+    NAMESPACE=${2:-tt}
+    
+    echo "[INFO] Triggering explicit GC on ${TARGET_POD}..."
+    kubectl exec -n ${NAMESPACE} ${TARGET_POD} -- \
+        sh -c 'java_pid=$(pgrep -f "java.*order"); jcmd $java_pid GC.run'
+    
+    echo "[INFO] GC triggered. Check JVM metrics for pause duration."

@@ -1,0 +1,97 @@
+# ============================================================
+# Cross-domain label mapping
+#
+# Maps external dataset labels to the canonical L1/L2/L3/L4 taxonomy.
+# Each entry: source_label -> {layer, fault_type, confidence}
+#   confidence: exact | coarse | unmapped
+#
+# Usage: loaded by diagnose.py / eval_retrieval.py in cross_domain mode.
+# ============================================================
+
+# TT_data (AnoMod) scenario labels -> locust dataset canonical labels
+# TT_data uses _parse_scenario_label() which maps:
+#   Lv_P -> L1 (Physical/Infrastructure)
+#   Lv_S -> L2 (Service/Network)
+#   Lv_D -> L3 (Data/Platform)
+#   Lv_C -> L4 (Code/Application)
+
+tt_data:
+  # --- L1: Infrastructure ---
+  CPU_preserve:
+    layer: L1
+    fault_type: cpu_pressure
+    confidence: exact
+
+  DISKIO_preserve:
+    layer: L1
+    fault_type: disk_io_saturation
+    confidence: exact
+
+  # Note: TT_data has no direct memory_pressure scenario under Lv_P.
+  # NETLOSS is under Lv_P in TT_data but maps to L2 in exp_runs taxonomy.
+  NETLOSS_preserve:
+    layer: L1
+    fault_type: packet_loss
+    confidence: coarse
+    note: "TT_data classifies this as Lv_P (infra), locust dataset as L2 (network)"
+
+  # --- L2: Network ---
+  DNSFAIL_preserve_no_order:
+    layer: L2
+    fault_type: dns_failure
+    confidence: exact
+
+  HTTPABORT_preserve:
+    layer: L2
+    fault_type: http_error_injection
+    confidence: coarse
+    note: "TT_data classifies as Lv_S (service), locust dataset has this under L4 (application)"
+
+  KILLPOD_preserve:
+    layer: L2
+    fault_type: pod_kill
+    confidence: coarse
+    note: "TT_data classifies as Lv_S (service), locust dataset has this under L3 (platform)"
+
+  # --- L3: Platform ---
+  CONNECTION_POOL_exhaustion:
+    layer: L3
+    fault_type: database_connection_exhaustion
+    confidence: coarse
+    note: "TT_data classifies as Lv_D (data/platform), locust dataset as L4 (application)"
+
+  TRANSACTION_timeout:
+    layer: L3
+    fault_type: database_connection_exhaustion
+    confidence: coarse
+    note: "No direct locust dataset equivalent; closest is db connection exhaustion"
+
+  cachelimit:
+    layer: L3
+    fault_type: resource_quota_exhaustion
+    confidence: coarse
+    note: "TT_data cache limit mapped to resource quota; approximate"
+
+  # --- L4: Application ---
+  exception_injection:
+    layer: L4
+    fault_type: http_error_injection
+    confidence: exact
+
+  security_check:
+    layer: L4
+    fault_type: http_error_injection
+    confidence: coarse
+    note: "Security check failure approximated as HTTP error"
+
+  travel_detail_failure:
+    layer: L4
+    fault_type: http_error_injection
+    confidence: coarse
+    note: "Application logic failure approximated as HTTP error"
+
+  # --- Normal ---
+  normal:
+    layer: Normal
+    fault_type: normal
+    confidence: exact

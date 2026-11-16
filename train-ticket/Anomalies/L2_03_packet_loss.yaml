@@ -1,0 +1,201 @@
+# ==============================================================================
+# L2-03: Network Packet Loss (Network/Communication Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: TCP/IP packet delivery reliability
+#   Target Component: Pod-to-pod communication (ts-order-service <-> tsdb-mysql)
+#   Description: Injects packet loss on traffic between ts-order-service and
+#                the MySQL database. This simulates network congestion, faulty
+#                network hardware, or CNI plugin issues. Database connections
+#                will experience intermittent failures and retries.
+#   Realism Score: HIGH - Packet loss in cloud environments is common (1-5% typical)
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: Metrics + Logs
+#     Expected Indicator:
+#       - TCP retransmission metrics increase
+#       - mysql_global_status_connection_errors_total increases
+#       - http_server_requests_seconds_count{status="5xx"} increases
+#   Secondary Evidence:
+#     - Application logs: "Communications link failure", "Connection reset"
+#     - MySQL logs: "Aborted connection" errors
+#     - Traces show incomplete database spans with error=true
+#     - HikariCP pool metrics show connection validation failures
+#
+# Duration: 90 seconds
+# Injection Method: tc netem with packet loss percentage
+# Target: Traffic between ts-order-service and MySQL
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l2-packet-loss-script
+  namespace: tt
+  labels:
+    chaos-layer: L2
+    chaos-type: packet-loss
+data:
+  inject.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Configuration
+    DURATION=${DURATION:-90}
+    LOSS_PERCENT=${LOSS_PERCENT:-15}
+    CORRELATION=${CORRELATION:-25}
+    TARGET_IP=${TARGET_IP:-""}  # MySQL service IP
+    
+    echo "=============================================="
+    echo "L2 ANOMALY: Packet Loss Injection"
+    echo "=============================================="
+    echo "Start Time: $(date -Iseconds)"
+    echo "Duration: ${DURATION}s"
+    echo "Packet Loss: ${LOSS_PERCENT}% (correlation: ${CORRELATION}%)"
+    echo "Target IP: ${TARGET_IP}"
+    echo "=============================================="
+    
+    INTERFACE=eth0
+    
+    # Install tools
+    if ! command -v tc &> /dev/null; then
+        apt-get update -qq && apt-get install -y -qq iproute2
+    fi
+    
+    # Cleanup existing rules
+    tc qdisc del dev ${INTERFACE} root 2>/dev/null || true
+    
+    if [ -n "$TARGET_IP" ]; then
+        # Targeted packet loss using tc filter
+        echo "[INJECT] Adding targeted ${LOSS_PERCENT}% packet loss to ${TARGET_IP}"
+        
+        # Create root qdisc
+        tc qdisc add dev ${INTERFACE} root handle 1: prio
+        
+        # Add netem qdisc for loss
+        tc qdisc add dev ${INTERFACE} parent 1:3 handle 30: netem loss ${LOSS_PERCENT}% ${CORRELATION}%
+        
+        # Filter traffic to target IP
+        tc filter add dev ${INTERFACE} protocol ip parent 1:0 prio 3 u32 \
+            match ip dst ${TARGET_IP}/32 flowid 1:3
+    else
+        # General packet loss on all traffic
+        echo "[INJECT] Adding general ${LOSS_PERCENT}% packet loss"
+        tc qdisc add dev ${INTERFACE} root netem loss ${LOSS_PERCENT}% ${CORRELATION}%
+    fi
+    
+    # Show rules
+    echo "[INFO] Current tc rules:"
+    tc qdisc show dev ${INTERFACE}
+    tc filter show dev ${INTERFACE} 2>/dev/null || true
+    
+    echo "[INJECT] Packet loss active, waiting ${DURATION}s..."
+    sleep ${DURATION}
+    
+    # Cleanup
+    echo "[CLEANUP] Removing packet loss rules..."
+    tc qdisc del dev ${INTERFACE} root 2>/dev/null || true
+    
+    echo "[COMPLETE] Packet loss injection finished at $(date -Iseconds)"
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l2-packet-loss-injector
+  namespace: tt
+  labels:
+    chaos-layer: L2
+    chaos-type: packet-loss
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L2
+        chaos-type: packet-loss
+    spec:
+      serviceAccountName: chaos-runner
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/hostname: train-ticket-worker
+      containers:
+        - name: packet-loss-injector
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              
+              DURATION=90
+              LOSS_PERCENT=15
+              TARGET_APP="ts-order-service"
+              
+              echo "=============================================="
+              echo "L2 ANOMALY: Packet Loss Injection"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "Target: ${TARGET_APP}"
+              echo "Duration: ${DURATION}s"
+              echo "Packet Loss: ${LOSS_PERCENT}%"
+              echo "=============================================="
+              
+              # Install tools
+              apt-get update -qq && apt-get install -y -qq iproute2 nsenter procps
+              
+              # Find Java process for target service in /host-proc
+              echo "[INFO] Searching for ${TARGET_APP} container..."
+              
+              TARGET_PID=""
+              for pid in $(ls /host-proc | grep -E '^[0-9]+$'); do
+                  if [ -f "/host-proc/$pid/cmdline" ]; then
+                      cmdline=$(cat /host-proc/$pid/cmdline 2>/dev/null | tr '\0' ' ' || true)
+                      if echo "$cmdline" | grep -q "ts-order-service" 2>/dev/null; then
+                          TARGET_PID=$pid
+                          echo "[INFO] Found target process: PID $pid"
+                          break
+                      fi
+                  fi
+              done
+              
+              if [ -z "$TARGET_PID" ]; then
+                  echo "[WARN] Target process not found, using general injection"
+                  # Inject on this pod's network
+                  tc qdisc del dev eth0 root 2>/dev/null || true
+                  tc qdisc add dev eth0 root netem loss ${LOSS_PERCENT}% 25%
+                  
+                  echo "[INJECT] Packet loss active"
+                  sleep ${DURATION}
+                  
+                  tc qdisc del dev eth0 root 2>/dev/null || true
+              else
+                  echo "[INFO] Injecting into network namespace of PID ${TARGET_PID}"
+                  
+                  # Use nsenter to access target network namespace
+                  nsenter --target ${TARGET_PID} --net tc qdisc del dev eth0 root 2>/dev/null || true
+                  nsenter --target ${TARGET_PID} --net tc qdisc add dev eth0 root netem loss ${LOSS_PERCENT}% 25%
+                  
+                  echo "[INJECT] Packet loss active in target namespace"
+                  nsenter --target ${TARGET_PID} --net tc qdisc show dev eth0
+                  
+                  sleep ${DURATION}
+                  
+                  nsenter --target ${TARGET_PID} --net tc qdisc del dev eth0 root 2>/dev/null || true
+              fi
+              
+              echo "[COMPLETE] Packet loss injection finished at $(date -Iseconds)"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: host-proc
+              mountPath: /host-proc
+              readOnly: true
+      volumes:
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+      restartPolicy: Never

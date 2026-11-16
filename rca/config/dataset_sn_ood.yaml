@@ -1,0 +1,42 @@
+# ============================================================
+# Query-side config for SN cross-service OOD (round_sn_ood).
+# 3 fault types (network_latency / container_kill /
+# container_memory_pressure) × 2 novel target services
+# (text-service / user-mention-service) × 3 = 18 experiments.
+#
+# Same SN fault catalog as round_sn1 train, injected on services
+# held out from the trained-on culprit set. Modeled on the TT
+# cross-service OOD template (dataset_ood_service.yaml): only
+# dataset.path differs from dataset_sn.yaml; encoder / params
+# stay identical so the trained SN encoder forward shape matches.
+#
+# checkpoint_dir + kb_dir come from the --config source
+# (dataset_sn.yaml) and are intentionally omitted here.
+# ============================================================
+
+dataset:
+  type: locust
+  path: social-network/exp_runs/round_sn_ood
+  params:
+    system: sn
+    num_metrics: 27
+    max_traces_per_experiment: 200
+    max_spans_per_trace: 30
+    min_spans_per_trace: 2
+    metric_window_seconds: 60.0
+    max_metric_points: 60
+    enable_rich_span_features: false
+    num_service_buckets: 64
+    num_operation_buckets: 1024
+    num_error_type_buckets: 32
+
+model:
+  trace:
+    enable_rich_features: false
+    service_embed_dim: 16
+    operation_embed_dim: 32
+    status_embed_dim: 4
+    num_status_classes: 4
+    error_type_embed_dim: 8
+    num_otel_status_classes: 3
+    otel_status_embed_dim: 4

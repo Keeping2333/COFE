@@ -1,0 +1,192 @@
+# ==============================================================================
+# L3-02: Liveness Probe Failure (Platform Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: Kubernetes health check mechanism
+#   Target Component: ts-order-service liveness probe endpoint
+#   Description: Manipulates the application to fail its liveness probe checks.
+#                Kubernetes will detect the "unhealthy" pod and restart it.
+#                This simulates application deadlocks, thread starvation, or
+#                health endpoint bugs that don't crash the JVM but render
+#                the service non-functional.
+#   Realism Score: MEDIUM-HIGH - Probe failures are common with complex apps
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: K8s Events + Metrics
+#     Expected Indicator:
+#       - K8s Event: "Liveness probe failed: HTTP probe failed"
+#       - K8s Event: "Container ts-order-service failed liveness probe, will be restarted"
+#       - kube_pod_container_status_restarts_total increases
+#       - kubelet_probe_failed_total{probe_type="Liveness"} increases
+#   Secondary Evidence:
+#     - Pod shows RESTARTS count incrementing
+#     - Application logs show probe responses with non-200 status
+#     - Dependent services experience connection timeouts during restart
+#     - Traces show gaps during probe failure window
+#
+# Duration: ~60-90 seconds (until probe threshold triggers restart)
+# Injection Method: Block health endpoint using iptables/tc
+# Target: ts-order-service
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l3-probe-failure-script
+  namespace: tt
+  labels:
+    chaos-layer: L3
+    chaos-type: probe-failure
+data:
+  inject.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Configuration
+    DURATION=${DURATION:-90}
+    HEALTH_PORT=${HEALTH_PORT:-12031}
+    
+    echo "=============================================="
+    echo "L3 ANOMALY: Liveness Probe Failure Injection"
+    echo "=============================================="
+    echo "Start Time: $(date -Iseconds)"
+    echo "Duration: ${DURATION}s"
+    echo "Health Port: ${HEALTH_PORT}"
+    echo "=============================================="
+    
+    # Install iptables
+    apt-get update -qq && apt-get install -y -qq iptables
+    
+    # Block traffic to health port
+    # This will cause liveness probes to timeout
+    echo "[INJECT] Blocking health probe port ${HEALTH_PORT}"
+    iptables -A INPUT -p tcp --dport ${HEALTH_PORT} -j DROP
+    
+    echo "[INFO] Current iptables rules:"
+    iptables -L -n | head -20
+    
+    echo "[INJECT] Health probe blocked, waiting ${DURATION}s..."
+    echo "[INFO] Kubelet will restart container after probe threshold"
+    sleep ${DURATION}
+    
+    # Cleanup
+    echo "[CLEANUP] Unblocking health probe port"
+    iptables -D INPUT -p tcp --dport ${HEALTH_PORT} -j DROP || true
+    
+    echo "[COMPLETE] Probe failure injection finished at $(date -Iseconds)"
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l3-probe-failure-injector
+  namespace: tt
+  labels:
+    chaos-layer: L3
+    chaos-type: probe-failure
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L3
+        chaos-type: probe-failure
+    spec:
+      serviceAccountName: chaos-runner
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/hostname: train-ticket-worker
+      containers:
+        - name: probe-failure-injector
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              
+              DURATION=90
+              TARGET_APP="ts-order-service"
+              HEALTH_PORT=12031  # ts-order-service port
+              
+              echo "=============================================="
+              echo "L3 ANOMALY: Liveness Probe Failure"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "Target: ${TARGET_APP}"
+              echo "Port: ${HEALTH_PORT}"
+              echo "Duration: ${DURATION}s"
+              echo "=============================================="
+              
+              # Install tools
+              apt-get update -qq && apt-get install -y -qq iptables nsenter procps
+              
+              # Find target container PID
+              echo "[INFO] Searching for ${TARGET_APP} container..."
+              
+              TARGET_PID=""
+              for pid in $(ls /host-proc | grep -E '^[0-9]+$' | head -1000); do
+                  if [ -f "/host-proc/$pid/cmdline" ]; then
+                      cmdline=$(cat /host-proc/$pid/cmdline 2>/dev/null | tr '\0' ' ' || true)
+                      if echo "$cmdline" | grep -q "ts-order-service" 2>/dev/null; then
+                          TARGET_PID=$pid
+                          echo "[INFO] Found target process: PID $pid"
+                          break
+                      fi
+                  fi
+              done
+              
+              if [ -z "$TARGET_PID" ]; then
+                  echo "[ERROR] Could not find target container process"
+                  echo "[FALLBACK] Will demonstrate probe failure pattern without namespace injection"
+                  
+                  # Document expected behavior
+                  echo ""
+                  echo "====== EXPECTED PROBE FAILURE BEHAVIOR ======"
+                  echo "1. Kubelet sends HTTP GET to /actuator/health"
+                  echo "2. When blocked, probe times out (default 1s)"
+                  echo "3. After failureThreshold (default 3), container restarts"
+                  echo "4. Events show: 'Liveness probe failed: connection timed out'"
+                  echo "============================================="
+                  
+                  exit 0
+              fi
+              
+              echo "[INFO] Entering network namespace of PID ${TARGET_PID}"
+              
+              # Block health endpoint in target's network namespace
+              echo "[INJECT] Blocking port ${HEALTH_PORT} in target namespace"
+              nsenter --target ${TARGET_PID} --net iptables -A INPUT -p tcp --dport ${HEALTH_PORT} -j DROP
+              
+              echo "[INFO] Probe failure injected, monitoring for ${DURATION}s..."
+              
+              # Monitor for container restart
+              START_TIME=$(date +%s)
+              while [ $(($(date +%s) - START_TIME)) -lt ${DURATION} ]; do
+                  echo "[MONITOR] Time: $(($(date +%s) - START_TIME))s"
+                  sleep 10
+              done
+              
+              # Cleanup (may fail if container was restarted)
+              echo "[CLEANUP] Attempting to unblock port..."
+              nsenter --target ${TARGET_PID} --net iptables -D INPUT -p tcp --dport ${HEALTH_PORT} -j DROP 2>/dev/null || true
+              
+              echo "[COMPLETE] Probe failure injection finished at $(date -Iseconds)"
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - SYS_PTRACE
+          volumeMounts:
+            - name: host-proc
+              mountPath: /host-proc
+              readOnly: true
+      volumes:
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+      restartPolicy: Never

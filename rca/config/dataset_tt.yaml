@@ -1,0 +1,13 @@
+# ============================================================
+# Query dataset config for cross-domain evaluation (TT_data)
+# Used with: --query-config rca/config/dataset_tt.yaml
+# ============================================================
+
+dataset:
+  type: anomod
+  path: data/TT_data
+  params:
+    max_traces_per_scenario: 100
+    max_spans_per_trace: 30
+    num_metrics: 10
+    max_metric_points: 60

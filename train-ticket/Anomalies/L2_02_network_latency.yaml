@@ -1,0 +1,191 @@
+# ==============================================================================
+# L2-02: Network Latency Injection (Network/Communication Layer)
+# ==============================================================================
+# Taxonomy & Realism:
+#   Structural Focus: TCP/IP communication path latency
+#   Target Component: Network interface of ts-travel-service pod
+#   Description: Injects artificial network latency (200ms) on egress traffic.
+#                This simulates cross-datacenter latency, congested networks,
+#                or slow upstream dependencies. The delay affects all outbound
+#                connections from the target pod.
+#   Realism Score: HIGH - Network latency is the most common distributed system issue
+#
+# Observability Signals (Smoking Gun):
+#   Primary Signal:
+#     Modality: Traces + Metrics
+#     Expected Indicator:
+#       - Span durations for ts-travel-service outbound calls increase by ~200ms
+#       - http_client_requests_seconds_bucket shifts right
+#       - tcp_retransmits_total may increase if latency triggers timeouts
+#   Secondary Evidence:
+#     - Upstream services (ts-route-service, ts-train-service) show normal latency
+#     - Application logs may show: "Request timeout" or slow response warnings
+#     - End-to-end trace shows bottleneck at ts-travel-service -> downstream
+#
+# Duration: 120 seconds
+# Injection Method: tc (traffic control) netem qdisc
+# Target: ts-travel-service pod
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l2-network-latency-script
+  namespace: tt
+  labels:
+    chaos-layer: L2
+    chaos-type: network-latency
+data:
+  inject.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Configuration
+    DURATION=${DURATION:-120}
+    LATENCY_MS=${LATENCY_MS:-200}
+    JITTER_MS=${JITTER_MS:-50}
+    INTERFACE=${INTERFACE:-eth0}
+    
+    echo "=============================================="
+    echo "L2 ANOMALY: Network Latency Injection"
+    echo "=============================================="
+    echo "Start Time: $(date -Iseconds)"
+    echo "Duration: ${DURATION}s"
+    echo "Latency: ${LATENCY_MS}ms ±${JITTER_MS}ms"
+    echo "Interface: ${INTERFACE}"
+    echo "=============================================="
+    
+    # Check if tc is available
+    if ! command -v tc &> /dev/null; then
+        echo "[ERROR] tc (traffic control) not found!"
+        apt-get update -qq && apt-get install -y -qq iproute2
+    fi
+    
+    # Remove any existing qdisc rules
+    echo "[CLEANUP] Removing existing qdisc rules..."
+    tc qdisc del dev ${INTERFACE} root 2>/dev/null || true
+    
+    # Add latency using netem
+    echo "[INJECT] Adding ${LATENCY_MS}ms latency to ${INTERFACE}"
+    tc qdisc add dev ${INTERFACE} root netem delay ${LATENCY_MS}ms ${JITTER_MS}ms distribution normal
+    
+    # Show current rules
+    echo "[INFO] Current tc rules:"
+    tc qdisc show dev ${INTERFACE}
+    
+    echo "[INJECT] Network latency active, waiting ${DURATION}s..."
+    sleep ${DURATION}
+    
+    # Cleanup
+    echo "[CLEANUP] Removing latency injection..."
+    tc qdisc del dev ${INTERFACE} root 2>/dev/null || true
+    
+    echo "[COMPLETE] Network latency injection finished at $(date -Iseconds)"
+    
+  cleanup.sh: |
+    #!/bin/bash
+    INTERFACE=${INTERFACE:-eth0}
+    echo "[CLEANUP] Removing tc qdisc rules from ${INTERFACE}..."
+    tc qdisc del dev ${INTERFACE} root 2>/dev/null || true
+    echo "[CLEANUP] Done"
+
+---
+# This approach injects tc rules from within the target pod's network namespace
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: l2-network-latency-injector
+  namespace: tt
+  labels:
+    chaos-layer: L2
+    chaos-type: network-latency
+    chaos-experiment: active
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        chaos-layer: L2
+        chaos-type: network-latency
+    spec:
+      hostPID: true
+      hostNetwork: false
+      nodeSelector:
+        kubernetes.io/hostname: train-ticket-worker
+      containers:
+        - name: latency-injector
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              
+              DURATION=120
+              LATENCY_MS=200
+              JITTER_MS=50
+              TARGET_APP="ts-travel-service"
+              
+              echo "=============================================="
+              echo "L2 ANOMALY: Network Latency Injection"
+              echo "=============================================="
+              echo "Start Time: $(date -Iseconds)"
+              echo "Target: ${TARGET_APP}"
+              echo "Duration: ${DURATION}s"
+              echo "Latency: ${LATENCY_MS}ms ±${JITTER_MS}ms"
+              echo "=============================================="
+              
+              # Install tools
+              apt-get update -qq && apt-get install -y -qq iproute2 nsenter util-linux
+              
+              # Find target container PID
+              TARGET_POD_IP=$(cat /etc/hosts | grep -v localhost | tail -1 | awk '{print $1}')
+              
+              # Get the PID of the target container via /proc
+              # Find containerd-shim processes and match by cgroup
+              echo "[INFO] Finding target container network namespace..."
+              
+              # Use nsenter to inject into target pod's network namespace
+              # First, find the PID
+              TARGET_PID=$(ps aux | grep "${TARGET_APP}" | grep java | head -1 | awk '{print $2}')
+              
+              if [ -z "$TARGET_PID" ]; then
+                  echo "[WARN] Could not find target PID, injecting on local namespace"
+                  INTERFACE=eth0
+                  
+                  tc qdisc del dev ${INTERFACE} root 2>/dev/null || true
+                  tc qdisc add dev ${INTERFACE} root netem delay ${LATENCY_MS}ms ${JITTER_MS}ms
+                  
+                  echo "[INJECT] Latency active on ${INTERFACE}"
+                  tc qdisc show dev ${INTERFACE}
+                  
+                  sleep ${DURATION}
+                  
+                  tc qdisc del dev ${INTERFACE} root 2>/dev/null || true
+              else
+                  echo "[INFO] Target PID: ${TARGET_PID}"
+                  # Enter target network namespace
+                  nsenter -t ${TARGET_PID} -n tc qdisc del dev eth0 root 2>/dev/null || true
+                  nsenter -t ${TARGET_PID} -n tc qdisc add dev eth0 root netem delay ${LATENCY_MS}ms ${JITTER_MS}ms
+                  
+                  echo "[INJECT] Latency injected into PID ${TARGET_PID} namespace"
+                  nsenter -t ${TARGET_PID} -n tc qdisc show dev eth0
+                  
+                  sleep ${DURATION}
+                  
+                  nsenter -t ${TARGET_PID} -n tc qdisc del dev eth0 root 2>/dev/null || true
+              fi
+              
+              echo "[COMPLETE] Network latency injection finished at $(date -Iseconds)"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: proc
+              mountPath: /host-proc
+              readOnly: true
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+            type: Directory
+      restartPolicy: Never
